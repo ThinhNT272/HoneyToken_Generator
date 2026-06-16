@@ -28,7 +28,7 @@
       "spns": [
         "MSSQLSvc/sql-decoy2.NTT.local:1433"
       ],
-      "description": "another account"
+      "description": "SQL Reporting Service Account"
     },
     {
       "username": "backup-admin",
@@ -40,11 +40,11 @@
     },
     {
       "username": "backup-user",
-      "password": "DecoyBackupPass789!",
+      "password": "DecoyBackupPass101!",
       "spns": [
         "HOST/backup-user.NTT.local"
       ],
-      "description": "Backup Administrator Account2"
+      "description": "Backup Service Account"
     }
   ],
 
