@@ -38,6 +38,12 @@ def create_ou_if_not_exists(conn, decoy_ou, dry_run=False):
         decoy_ou (str): The DN of the OU to create (e.g. OU=Decoys,DC=NTT,DC=local).
         dry_run (bool): If True, simulate changes without modifying AD.
     """
+    if dry_run:
+        parts = decoy_ou.split(',', 1)
+        ou_name = parts[0].split('=', 1)[1]
+        logger.info(f"[DRY-RUN] Would check/create OU '{ou_name}' at '{decoy_ou}'")
+        return
+
     if conn.search(decoy_ou, '(objectClass=organizationalUnit)', search_scope=SUBTREE):
         logger.info(f"Decoy OU '{decoy_ou}' already exists.")
         return
@@ -45,10 +51,6 @@ def create_ou_if_not_exists(conn, decoy_ou, dry_run=False):
     # Extract the OU name and parent DN
     parts = decoy_ou.split(',', 1)
     ou_name = parts[0].split('=', 1)[1]
-    
-    if dry_run:
-        logger.info(f"[DRY-RUN] Would create OU '{ou_name}' at '{decoy_ou}'")
-        return
         
     logger.info(f"Creating Decoy OU: {decoy_ou}")
     success = conn.add(decoy_ou, 'organizationalUnit', {'ou': ou_name})
@@ -73,24 +75,19 @@ def deploy_ldap_decoy(conn, decoy, decoy_ou, domain_name, dry_run=False):
     
     dn = f"CN={username},{decoy_ou}"
     
+    if dry_run:
+        logger.info(f"[DRY-RUN] Would create/verify user '{username}' with SPNs {spns}")
+        return
+
     # Check if account already exists
     exists = conn.search(dn, '(objectClass=user)', search_scope=SUBTREE)
     
     if exists:
         logger.info(f"Decoy account '{username}' already exists at DN '{dn}' (Idempotent: skipping creation)")
-        if dry_run:
-            logger.info(f"[DRY-RUN] Would verify existing decoy '{username}'")
-            return
-        
-        # Optionally update description/SPNs if they differ (idempotency support)
         conn.modify(dn, {
             'description': [(MODIFY_REPLACE, [description])],
             'servicePrincipalName': [(MODIFY_REPLACE, spns)]
         })
-        return
-
-    if dry_run:
-        logger.info(f"[DRY-RUN] Would create user '{username}' with SPNs {spns}")
         return
 
     logger.info(f"Creating user account '{username}'...")
@@ -141,14 +138,14 @@ def cleanup_ldap_decoy(conn, username, decoy_ou, dry_run=False):
     """
     dn = f"CN={username},{decoy_ou}"
     
+    if dry_run:
+        logger.info(f"[DRY-RUN] Would delete user '{username}' (DN: {dn})")
+        return
+
     # Check if exists
     exists = conn.search(dn, '(objectClass=user)', search_scope=SUBTREE)
     if not exists:
         logger.info(f"Decoy account '{username}' does not exist (skipping).")
-        return
-
-    if dry_run:
-        logger.info(f"[DRY-RUN] Would delete user '{username}' (DN: {dn})")
         return
 
     logger.info(f"Deleting user account '{username}'...")
@@ -165,18 +162,11 @@ def delete_ou_if_empty(conn, decoy_ou, dry_run=False):
         decoy_ou (str): DN of target OU.
         dry_run (bool): Dry-run flag.
     """
-    if not conn.search(decoy_ou, '(objectClass=organizationalUnit)', search_scope=SUBTREE):
-        return
-
-    # Check for children entries
-    conn.search(decoy_ou, '(objectClass=*)', search_scope=SUBTREE)
-    # The search will always return the OU itself. If entries > 1, it's not empty.
-    if len(conn.entries) > 1:
-        logger.info(f"Decoy OU '{decoy_ou}' is not empty; skipping deletion.")
-        return
-
     if dry_run:
-        logger.info(f"[DRY-RUN] Would delete empty OU '{decoy_ou}'")
+        logger.info(f"[DRY-RUN] Would check and delete empty OU '{decoy_ou}'")
+        return
+
+    if not conn.search(decoy_ou, '(objectClass=organizationalUnit)', search_scope=SUBTREE):
         return
 
     logger.info(f"Deleting empty Decoy OU: {decoy_ou}")
