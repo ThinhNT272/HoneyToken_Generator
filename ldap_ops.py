@@ -7,10 +7,12 @@ Handles all interactions with the Domain Controller via LDAP/LDAPS:
 - Creating and deleting honey-token user/service accounts with SPNs
 """
 
+import ssl
 import logging
 from ldap3 import (
     Server,
     Connection,
+    Tls,
     ALL,
     BASE,
     LEVEL,
@@ -30,7 +32,12 @@ def get_connection(ip: str, domain: str, admin_username: str,
                    admin_password: str, port: int = 636) -> Connection:
     """Establishes an LDAP/LDAPS connection to the Domain Controller.
 
-    Uses SSL when port is 636 (LDAPS), plain LDAP otherwise.
+    - Port 636: Uses LDAPS (SSL from the start).
+    - Port 389: Uses plain LDAP then upgrades to StartTLS for encryption.
+
+    StartTLS is required on port 389 because Active Directory refuses to
+    modify the unicodePwd attribute (set passwords) over unencrypted connections.
+    Certificate validation is disabled for lab environments with self-signed certs.
 
     Args:
         ip: DC IP address (e.g., '192.168.100.50').
@@ -45,18 +52,39 @@ def get_connection(ip: str, domain: str, admin_username: str,
     Raises:
         LDAPException: If the connection or authentication fails.
     """
+    # TLS config — disable certificate validation for lab self-signed certs
+    tls_config = Tls(validate=ssl.CERT_NONE)
+
     use_ssl = (port == 636)
-    server = Server(ip, port=port, use_ssl=use_ssl, get_info=ALL)
 
-    logger.info(f"Connecting to Domain Controller at {ip}:{port} (SSL: {use_ssl})")
+    if use_ssl:
+        # LDAPS: SSL from the start on port 636
+        server = Server(ip, port=port, use_ssl=True, tls=tls_config, get_info=ALL)
+        logger.info(f"Connecting to Domain Controller at {ip}:{port} (LDAPS)")
 
-    conn = Connection(
-        server,
-        user=admin_username,
-        password=admin_password,
-        auto_bind=True,
-        raise_exceptions=True,
-    )
+        conn = Connection(
+            server,
+            user=admin_username,
+            password=admin_password,
+            auto_bind=True,
+            raise_exceptions=True,
+        )
+    else:
+        # LDAP + StartTLS: connect on port 389, then upgrade to encrypted
+        server = Server(ip, port=port, use_ssl=False, tls=tls_config, get_info=ALL)
+        logger.info(f"Connecting to Domain Controller at {ip}:{port} (LDAP + StartTLS)")
+
+        conn = Connection(
+            server,
+            user=admin_username,
+            password=admin_password,
+            auto_bind=False,
+            raise_exceptions=True,
+        )
+        conn.open()
+        conn.start_tls()
+        conn.bind()
+        logger.info("StartTLS negotiated successfully")
 
     logger.info("LDAP connection established successfully")
     return conn

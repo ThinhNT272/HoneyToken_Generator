@@ -2,7 +2,7 @@
   "domain_controller": {
     "ip": "192.168.100.50",
     "domain_name": "NTT.local",
-    "ldaps_port": 636,
+    "ldaps_port": 389,
     "admin_username": "NTT\\administrator",
     "admin_password": "DCAdminPassword123!",
     "decoy_ou": "OU=Decoys,DC=NTT,DC=local"
