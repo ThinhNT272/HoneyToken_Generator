@@ -1,0 +1,67 @@
+{
+  "domain_controller": {
+    "ip": "192.168.100.50",
+    "domain_name": "NTT.local",
+    "ldaps_port": 636,
+    "admin_username": "NTT\\administrator",
+    "admin_password": "DCAdminPassword123!",
+    "decoy_ou": "OU=Decoys,DC=NTT,DC=local"
+  },
+
+  "deployment_settings": {
+    "min_decoys_per_host": 1,
+    "max_decoys_per_host": 2
+  },
+
+  "decoys": [
+    {
+      "username": "sql-decoy",
+      "password": "DecoyPassword123!",
+      "spns": [
+        "MSSQLSvc/sql-decoy.NTT.local:1433"
+      ],
+      "description": "SQL Database Service Account for Automated Backup"
+    },
+    {
+      "username": "sql-decoy2",
+      "password": "DecoyPassword456!",
+      "spns": [
+        "MSSQLSvc/sql-decoy2.NTT.local:1433"
+      ],
+      "description": "another account"
+    },
+    {
+      "username": "backup-admin",
+      "password": "DecoyBackupPass789!",
+      "spns": [
+        "HOST/backup-admin.NTT.local"
+      ],
+      "description": "Backup Administrator Account"
+    },
+    {
+      "username": "backup-user",
+      "password": "DecoyBackupPass789!",
+      "spns": [
+        "HOST/backup-user.NTT.local"
+      ],
+      "description": "Backup Administrator Account2"
+    }
+  ],
+
+  "endpoints": [
+    {
+      "ip": "192.168.100.10",
+      "hostname": "WS01",
+      "winrm_username": "administrator",
+      "winrm_password": "WS01AdminPassword123!",
+      "winrm_transport": "ntlm"
+    },
+    {
+      "ip": "192.168.100.20",
+      "hostname": "WS02",
+      "winrm_username": "administrator",
+      "winrm_password": "WS02AdminPassword123!",
+      "winrm_transport": "ntlm"
+    }
+  ]
+}
