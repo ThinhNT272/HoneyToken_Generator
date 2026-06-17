@@ -13,7 +13,7 @@ from ldap3 import (
     Server,
     Connection,
     Tls,
-    ALL,
+    NONE,
     BASE,
     LEVEL,
     SUBTREE,
@@ -59,7 +59,7 @@ def get_connection(ip: str, domain: str, admin_username: str,
 
     if use_ssl:
         # LDAPS: SSL from the start on port 636
-        server = Server(ip, port=port, use_ssl=True, tls=tls_config, get_info=ALL)
+        server = Server(ip, port=port, use_ssl=True, tls=tls_config, get_info=NONE)
         logger.info(f"Connecting to Domain Controller at {ip}:{port} (LDAPS)")
 
         conn = Connection(
@@ -71,7 +71,7 @@ def get_connection(ip: str, domain: str, admin_username: str,
         )
     else:
         # LDAP + StartTLS: connect on port 389, then upgrade to encrypted
-        server = Server(ip, port=port, use_ssl=False, tls=tls_config, get_info=ALL)
+        server = Server(ip, port=port, use_ssl=False, tls=tls_config, get_info=NONE)
         logger.info(f"Connecting to Domain Controller at {ip}:{port} (LDAP + StartTLS)")
 
         conn = Connection(
