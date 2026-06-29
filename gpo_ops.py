@@ -114,13 +114,21 @@ Version={new_version}
     domain_dn = ",".join([f"DC={part}" for part in domain_name.split(".")])
     gpo_ad_dn = f"CN={{{gpo_guid}}},CN=Policies,CN=System,{domain_dn}"
     
+    # Configure the Scripts CSE extension GUIDs so Windows clients process the startup script
+    cse_guid_str = (
+        "[{962A0534-0E65-11D2-824F-00105A14F938}{42B5F986-6536-11D2-AE5A-0000F87571E3}]"
+        "[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{42B5F986-6536-11D2-AE5A-0000F87571E3}]"
+    )
     code, stdout, stderr = _run_ps_cmd(
-        f"Set-ADObject -Identity '{gpo_ad_dn}' -Replace @{{versionNumber={new_version}}}"
+        f"Set-ADObject -Identity '{gpo_ad_dn}' -Replace @{{"
+        f"versionNumber={new_version}; "
+        f"gPCMachineExtensionNames='{cse_guid_str}'"
+        f"}}"
     )
     if code != 0:
-        logger.warning(f"Failed to update GPO versionNumber in AD: {stderr}. GPO may sync slower.")
+        logger.warning(f"Failed to update GPO attributes in AD: {stderr}. GPO may not apply.")
     else:
-        logger.info("GPO version successfully updated in Active Directory.")
+        logger.info("GPO version and Extension CSE GUIDs successfully updated in Active Directory.")
 
 
 def remove_gpo(gpo_name: str) -> None:
