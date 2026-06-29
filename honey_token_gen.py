@@ -160,7 +160,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         # Assign SPNs if any
         if spns:
             spn_list = ",".join([f"'{s}'" for s in spns])
-            spn_cmd = f"Set-ADUser -Identity '{username}' -ServicePrincipalNames @({spn_list})"
+            spn_cmd = f"Set-ADUser -Identity '{username}' -ServicePrincipalNames @{{Replace=@({spn_list})}}"
             code, stdout, stderr = _run_ps_cmd(spn_cmd)
             if code != 0:
                 logger.warning(f"Failed to assign SPNs to '{username}': {stderr}")
