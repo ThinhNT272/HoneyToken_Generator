@@ -138,7 +138,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         user_check_cmd = f"Get-ADUser -Filter \"SamAccountName -eq '{username}'\" -ErrorAction SilentlyContinue"
         code, stdout, stderr = _run_ps_cmd(user_check_cmd)
         
-        if code != 0:
+        if code != 0 or not stdout:
             # Create user
             create_user_cmd = (
                 f"$secPass = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
