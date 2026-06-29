@@ -93,7 +93,7 @@ if ($DecoysToInject) {
 
     foreach ($decoy in $DecoysToInject) {
         $taskName = "$TASK_PREFIX$($decoy.username)"
-        $runAsUser = "$DomainName\\$($decoy.username)"
+        $runAsUser = "$DomainName\$($decoy.username)"
         $password = $decoy.password
         
         # Check if the task already exists and is running
