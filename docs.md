@@ -37,12 +37,11 @@ The application is a Python CLI tool that runs on the **SIEM Server** (Ubuntu, 1
 - Raises `FileNotFoundError` if file doesn't exist, `ValueError` if validation fails
 
 **`_validate_config(config: dict) -> None`**
-- Validates all required top-level keys: `domain_controller`, `deployment_settings`, `decoys`, `endpoints`
+- Validates all required top-level keys: `domain_controller`, `decoys`, `endpoints`
 - Validates all required sub-keys within each section
-- Checks `min_decoys_per_host <= max_decoys_per_host`
 - Ensures all decoy usernames are **unique** (no duplicates)
-- Validates SPN format using regex: `service/host` or `service/host:port`
-- Warns if the decoy pool might be too small for the configured distribution settings
+- SPNs are **optional** — missing or empty list is allowed (non-service user accounts)
+- If SPNs are provided, validates format using regex: `service/host` or `service/host:port`
 
 ---
 
@@ -90,7 +89,7 @@ The application is a Python CLI tool that runs on the **SIEM Server** (Ubuntu, 1
 
 ### winrm_ops.py — WinRM Operations
 
-**Purpose:** Handles credential injection and removal on Windows endpoints.
+**Purpose:** Handles credential injection and removal on Windows endpoints. Each honey-token credential is injected by launching a hidden background PowerShell process under the decoy user's credentials via `Start-Process -Credential`. This creates a real Interactive logon session (Type 2) in LSASS, causing each decoy to appear as a separate session with NTLM/SHA1 hashes — indistinguishable from genuine cached credentials.
 
 #### Functions
 
@@ -99,25 +98,17 @@ The application is a Python CLI tool that runs on the **SIEM Server** (Ubuntu, 1
 - Returns a `winrm.Session` object
 
 **`inject_credential_decoy(session, domain, username, password, dry_run) -> None`**
-- Injects a fake cached credential using `cmdkey /add`
-- Uses a **unique target per decoy**: `username.domain` (e.g., `sql-decoy.NTT.local`)
-- This prevents multiple decoys on the same host from overwriting each other
-- After injection, calls `_verify_credential()` to confirm it was stored
+- Launches a hidden background PowerShell process under the decoy user's credentials via `Start-Process -Credential`
+- This creates a genuine Interactive logon session (Type 2) in LSASS with NTLM and SHA1 hashes
+- Each decoy gets its own separate logon session with a unique Authentication ID
+- The holder process PID is saved to the registry at `HKLM:\SOFTWARE\HoneyTokens\<username>` for cleanup
 
 **`remove_credential_decoy(session, domain, username, dry_run) -> None`**
-- Removes a specific credential using `cmdkey /delete` with the same unique target
-- Tolerates non-zero exit codes (the credential might already be removed)
-
-**`_build_target(username, domain) -> str`**
-- Builds the unique cmdkey target string: `{username}.{domain}`
-
-**`_verify_credential(session, target, user_principal) -> None`**
-- Runs `cmdkey /list` and checks if the expected target appears in the output
-- Logs a warning if verification fails (may occur due to user session differences)
-
-**`_run_cmd(session, command, args) -> tuple`**
-- Executes a cmd.exe command on the remote host
-- Returns `(status_code, stdout, stderr)`
+- Reads the holder process PID from the registry at `HKLM:\SOFTWARE\HoneyTokens\<username>`
+- Kills the process (which destroys the logon session and purges credentials from LSASS)
+- Removes the registry entry
+- Cleans up the `HKLM:\SOFTWARE\HoneyTokens` key if no more entries remain
+- Tolerates missing processes or registry entries (idempotent)
 
 **`_run_ps(session, script) -> tuple`**
 - Executes a PowerShell script on the remote host
@@ -135,31 +126,27 @@ The application is a Python CLI tool that runs on the **SIEM Server** (Ubuntu, 1
 - Configures dual logging: console (INFO level) + file (DEBUG level)
 - Log file: `honey_token_gen.log`
 
-**`_distribute_decoys(decoys_pool, endpoints, min_per_host, max_per_host) -> dict`**
-- Shuffles the decoy pool randomly
-- Assigns a random count of decoys (between min and max) to each endpoint
-- If the pool runs out, remaining endpoints get fewer decoys (no wrapping/reuse)
-- Returns a mapping: `{hostname: [decoy1, decoy2, ...]}`
-
 **`cmd_deploy(args) -> None`**
 - Full deploy orchestration:
   1. Loads and validates config
   2. Checks that no existing deployment exists (prevents double-deploy)
   3. Connects to DC via LDAP
   4. Creates the Decoy OU
-  5. Distributes decoys across endpoints
-  6. For each endpoint: connects via WinRM, creates AD accounts, injects credentials
-  7. Writes `list.json`
-  8. Prints a summary with success/failure counts
+  5. Creates all AD accounts first (idempotent)
+  6. For each endpoint: connects via WinRM, injects all decoy credentials
+  7. Writes `list.json` (deployment record)
+  8. Writes `honey_tokens` (Wazuh CDB list — unique usernames in `key:value` format)
+  9. Prints a summary with success/failure counts
 
 **`cmd_cleanup(args) -> None`**
 - Full cleanup orchestration:
   1. Reads `list.json` for deployed decoys
   2. Loads config for connection credentials
-  3. For each decoy: removes credential (WinRM) + deletes AD account (LDAP)
+  3. For each decoy: kills holder process (WinRM) + deletes AD account (LDAP)
   4. Deletes Decoy OU if empty
   5. Deletes `list.json`
-  6. Prints a summary
+  6. Deletes `honey_tokens` (CDB list)
+  7. Prints a summary
 
 **`main() -> None`**
 - Parses CLI arguments using argparse with subcommands (`deploy`, `cleanup`)
@@ -178,18 +165,29 @@ User runs: python honey_token_gen.py deploy --config config.json
 ├── Check list.json doesn't exist (prevent double-deploy)
 ├── Connect to DC01 via LDAPS
 ├── Create OU=Decoys if not exists
-├── Shuffle decoy pool → assign random count per endpoint
 │
-├── For WS01 (assigned: sql-decoy, backup-admin):
+├── Create all AD accounts (idempotent):
+│   ├── Create 'sql-decoy' with SPN in AD
+│   ├── Create 'backup-svc' with SPN in AD
+│   ├── Create 'john.nguyen' (no SPN) in AD
+│   └── Create 'admin.le' (no SPN) in AD
+│
+├── For WS01:
 │   ├── Connect to WS01 via WinRM
-│   ├── Create 'sql-decoy' in AD → inject credential on WS01
-│   └── Create 'backup-admin' in AD → inject credential on WS01
+│   ├── Inject credential for 'sql-decoy' (Start-Process -Credential)
+│   ├── Inject credential for 'backup-svc'
+│   ├── Inject credential for 'john.nguyen'
+│   └── Inject credential for 'admin.le'
 │
-├── For WS02 (assigned: sql-decoy2):
+├── For WS02:
 │   ├── Connect to WS02 via WinRM
-│   └── Create 'sql-decoy2' in AD → inject credential on WS02
+│   ├── Inject credential for 'sql-decoy'
+│   ├── Inject credential for 'backup-svc'
+│   ├── Inject credential for 'john.nguyen'
+│   └── Inject credential for 'admin.le'
 │
 ├── Write list.json (deployment record)
+├── Write honey_tokens (Wazuh CDB list)
 └── Print summary
 ```
 
@@ -198,24 +196,18 @@ User runs: python honey_token_gen.py deploy --config config.json
 ```
 User runs: python honey_token_gen.py cleanup --config config.json
 │
-├── Read list.json → find 3 deployed decoys
+├── Read list.json → find deployed decoys
 ├── Load config.json → get connection credentials
 ├── Connect to DC01 via LDAPS
 │
-├── sql-decoy on WS01:
-│   ├── Connect to WS01 via WinRM → cmdkey /delete:sql-decoy.NTT.local
-│   └── Delete CN=sql-decoy from AD
-│
-├── backup-admin on WS01:
-│   ├── (reuse WS01 session) → cmdkey /delete:backup-admin.NTT.local
-│   └── Delete CN=backup-admin from AD
-│
-├── sql-decoy2 on WS02:
-│   ├── Connect to WS02 via WinRM → cmdkey /delete:sql-decoy2.NTT.local
-│   └── Delete CN=sql-decoy2 from AD
+├── For each decoy on each workstation:
+│   ├── Connect to workstation via WinRM
+│   ├── Kill holder process (PID from registry) → credential removed from LSASS
+│   └── Delete AD account from Decoy OU
 │
 ├── Delete OU=Decoys (if empty)
 ├── Delete list.json
+├── Delete honey_tokens (CDB list)
 └── Print summary
 ```
 
@@ -223,10 +215,12 @@ User runs: python honey_token_gen.py cleanup --config config.json
 
 ## Integration with Wazuh
 
-After deployment, the `list.json` file contains all deployed honey-token usernames and their SPNs. Wazuh uses this information (via CDB lists) to monitor for unauthorized interactions:
+After deployment, the application generates a `honey_tokens` file in Wazuh CDB list format (`key:value` pairs). This file can be copied directly to the Wazuh Manager at `/var/ossec/etc/lists/honey_tokens` for monitoring. The `list.json` file contains detailed deployment information (usernames, SPNs, workstation assignments).
+
+Wazuh uses the CDB list to monitor for unauthorized interactions with honey-token accounts:
 
 - **Event 4769** (TGS-REQ) with a honey-token SPN → Kerberoasting detected
 - **Event 4776** (NTLM validation) with a honey-token username → Pass-the-Hash detected
-- **Event 4624** (Successful logon, type 3) with a honey-token username → Pass-the-Hash detected
+- **Event 4624** (Successful logon, type 3) with a honey-token username → Unauthorized access detected
 
 When a match is found, Wazuh triggers an Active Response script that calls the pfSense API to block the attacker's IP address.

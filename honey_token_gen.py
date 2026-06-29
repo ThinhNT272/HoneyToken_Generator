@@ -14,7 +14,7 @@ Usage:
 import os
 import sys
 import json
-import random
+
 import logging
 import argparse
 from datetime import datetime
@@ -35,6 +35,7 @@ from winrm_ops import (
 
 # --- Constants ---
 LIST_FILE = "list.json"
+CDB_FILE = "honey_tokens"
 LOG_FILE = "honey_token_gen.log"
 
 
@@ -70,63 +71,15 @@ def setup_logging() -> None:
 logger = logging.getLogger("honey_token_gen")
 
 
-def _distribute_decoys(decoys_pool: list, endpoints: list,
-                       min_per_host: int, max_per_host: int) -> dict:
-    """Randomly distributes decoys across endpoints.
-
-    Shuffles the decoy pool and assigns a random number of decoys
-    (between min and max) to each endpoint. If the pool runs out,
-    remaining endpoints receive fewer decoys.
-
-    Args:
-        decoys_pool: List of decoy definitions from config.
-        endpoints: List of endpoint definitions from config.
-        min_per_host: Minimum number of decoys per host.
-        max_per_host: Maximum number of decoys per host.
-
-    Returns:
-        A dict mapping endpoint hostname to a list of decoy definitions.
-        Example: {"WS01": [decoy1, decoy2], "WS02": [decoy3]}
-    """
-    # Shuffle decoys for random distribution
-    pool = list(decoys_pool)
-    random.shuffle(pool)
-
-    distribution = {}
-    pool_index = 0
-
-    for endpoint in endpoints:
-        hostname = endpoint["hostname"]
-        remaining = len(pool) - pool_index
-
-        if remaining <= 0:
-            logger.warning(
-                f"Decoy pool exhausted — no decoys available for host '{hostname}'"
-            )
-            distribution[hostname] = []
-            continue
-
-        # Pick a random count, but don't exceed remaining pool size
-        count = random.randint(min_per_host, max_per_host)
-        count = min(count, remaining)
-
-        distribution[hostname] = pool[pool_index:pool_index + count]
-        pool_index += count
-
-        logger.info(f"Assigned {count} decoy(s) to host '{hostname}'")
-
-    return distribution
-
-
 def cmd_deploy(args: argparse.Namespace) -> None:
     """Orchestrates the full deployment workflow.
 
     1. Loads config
     2. Connects to DC via LDAP
     3. Creates decoy OU
-    4. Distributes decoys randomly across endpoints
-    5. For each endpoint: create AD accounts + inject cached credentials
-    6. Writes list.json output file
+    4. Deploys all decoys to all endpoints
+    5. For each endpoint: create AD accounts + inject credentials
+    6. Writes list.json and honey_tokens (CDB list) output files
 
     Args:
         args: Parsed CLI arguments (config path, dry-run flag).
@@ -146,7 +99,6 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     dc_config = config["domain_controller"]
-    settings = config["deployment_settings"]
     decoys_pool = config["decoys"]
     endpoints = config["endpoints"]
 
@@ -182,25 +134,35 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         logger.error(f"Failed to create Decoy OU: {e}")
         sys.exit(1)
 
-    # --- Distribute decoys across endpoints ---
-    distribution = _distribute_decoys(
-        decoys_pool=decoys_pool,
-        endpoints=endpoints,
-        min_per_host=settings["min_decoys_per_host"],
-        max_per_host=settings["max_decoys_per_host"],
-    )
-
-    # --- Deploy to each endpoint ---
-    deployed_decoys = []
+    # --- Create all AD accounts first (idempotent) ---
     stats = {"ad_success": 0, "ad_fail": 0, "cred_success": 0, "cred_fail": 0}
+    ad_created = set()  # Track which accounts were successfully created
+
+    for decoy in decoys_pool:
+        username = decoy["username"]
+        try:
+            deploy_ldap_decoy(
+                conn=ldap_conn,
+                decoy=decoy,
+                decoy_ou=dc_config["decoy_ou"],
+                domain_name=dc_config["domain_name"],
+                dry_run=dry_run,
+            )
+            stats["ad_success"] += 1
+            ad_created.add(username)
+        except Exception as e:
+            logger.error(
+                f"Failed to deploy '{username}' to AD: {e}. "
+                f"Skipping credential injection for this decoy."
+            )
+            stats["ad_fail"] += 1
+
+    # --- Inject credentials on all endpoints ---
+    deployed_decoys = []
 
     for endpoint in endpoints:
         hostname = endpoint["hostname"]
         ip = endpoint["ip"]
-        assigned_decoys = distribution.get(hostname, [])
-
-        if not assigned_decoys:
-            continue
 
         logger.info(f"--- Processing host '{hostname}' ({ip}) ---")
 
@@ -221,32 +183,17 @@ def cmd_deploy(args: argparse.Namespace) -> None:
                 f"Failed to connect to '{hostname}' via WinRM: {e}. "
                 f"Skipping all decoys for this host."
             )
-            stats["cred_fail"] += len(assigned_decoys)
+            stats["cred_fail"] += len(decoys_pool)
             continue
 
-        # Deploy each assigned decoy
-        for decoy in assigned_decoys:
+        # Inject all decoys that were successfully created in AD
+        for decoy in decoys_pool:
             username = decoy["username"]
 
-            # Step 1: Create AD account via LDAP
-            try:
-                deploy_ldap_decoy(
-                    conn=ldap_conn,
-                    decoy=decoy,
-                    decoy_ou=dc_config["decoy_ou"],
-                    domain_name=dc_config["domain_name"],
-                    dry_run=dry_run,
-                )
-                stats["ad_success"] += 1
-            except Exception as e:
-                logger.error(
-                    f"Failed to deploy '{username}' to AD: {e}. "
-                    f"Skipping credential injection for this decoy."
-                )
-                stats["ad_fail"] += 1
+            # Skip decoys that failed AD creation
+            if username not in ad_created:
                 continue
 
-            # Step 2: Inject cached credential on endpoint via WinRM
             try:
                 inject_credential_decoy(
                     session=winrm_sess,
@@ -260,7 +207,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
                 # Record successful deployment
                 deployed_decoys.append({
                     "username": username,
-                    "spns": decoy["spns"],
+                    "spns": decoy.get("spns", []),
                     "description": decoy["description"],
                     "workstation": hostname,
                 })
@@ -270,7 +217,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
                 )
                 stats["cred_fail"] += 1
 
-    # --- Write deployment record ---
+    # --- Write deployment record (list.json) ---
     if not dry_run:
         now = datetime.now()
         output_data = {
@@ -286,10 +233,28 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             logger.info(f"Deployment record written to '{LIST_FILE}'")
         except Exception as e:
             logger.error(f"Failed to write deployment record: {e}")
+
+        # --- Write CDB list for Wazuh (unique usernames only) ---
+        try:
+            seen = set()
+            cdb_lines = []
+            for decoy in deployed_decoys:
+                if decoy["username"] not in seen:
+                    seen.add(decoy["username"])
+                    cdb_lines.append(f"{decoy['username']}:{decoy['description']}")
+
+            with open(CDB_FILE, "w") as f:
+                f.write("\n".join(cdb_lines) + "\n")
+            logger.info(f"Wazuh CDB list written to '{CDB_FILE}'")
+        except Exception as e:
+            logger.error(f"Failed to write CDB list: {e}")
     else:
         logger.info(
             f"[DRY-RUN] Would write deployment record to '{LIST_FILE}' "
             f"containing {len(deployed_decoys)} decoy(s)"
+        )
+        logger.info(
+            f"[DRY-RUN] Would write Wazuh CDB list to '{CDB_FILE}'"
         )
 
     # --- Print summary ---
@@ -455,15 +420,24 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
     except Exception as e:
         logger.error(f"Failed to clean up Decoy OU: {e}")
 
-    # --- Delete the deployment record file ---
+    # --- Delete the deployment record files ---
     if not dry_run:
         try:
             os.remove(LIST_FILE)
             logger.info(f"Deleted deployment record '{LIST_FILE}'")
         except Exception as e:
             logger.error(f"Failed to delete '{LIST_FILE}': {e}")
+
+        # Delete the Wazuh CDB list file
+        if os.path.exists(CDB_FILE):
+            try:
+                os.remove(CDB_FILE)
+                logger.info(f"Deleted Wazuh CDB list '{CDB_FILE}'")
+            except Exception as e:
+                logger.error(f"Failed to delete '{CDB_FILE}': {e}")
     else:
         logger.info(f"[DRY-RUN] Would delete deployment record '{LIST_FILE}'")
+        logger.info(f"[DRY-RUN] Would delete Wazuh CDB list '{CDB_FILE}'")
 
     # --- Print summary ---
     logger.info("=" * 60)

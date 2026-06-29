@@ -1,14 +1,13 @@
 # Honey Token Generator
 
-A Python CLI tool for deploying and cleaning up deception honey-tokens within an Active Directory (AD) environment. It creates fake user and service accounts in AD, assigns Service Principal Names (SPNs) for Kerberoasting detection, and injects cached credentials onto workstations for Pass-the-Hash detection.
+A Python CLI tool for deploying and cleaning up deception honey-tokens within an Active Directory (AD) environment. It creates fake user and service accounts in AD, assigns Service Principal Names (SPNs) for Kerberoasting detection, and injects realistic cached credentials (as separate logon sessions) onto workstations for Pass-the-Hash detection.
 
 ## Features
 
 - **Decoy Provisioning** — Automatically creates randomized user/service accounts under a dedicated OU in Active Directory via LDAP/LDAPS.
 - **Kerberoasting Trap** — Assigns specific SPNs to decoy accounts. When an attacker requests a Service Ticket for these SPNs, it triggers a Wazuh alert.
-- **Pass-the-Hash Trap** — Injects fake cached credentials onto endpoint workstations via WinRM using Windows Credential Manager (`cmdkey`). When an attacker dumps and uses these credentials, it triggers a Wazuh alert.
-- **Random Distribution** — Shuffles the decoy pool and assigns a random number of decoys (configurable min/max) to each endpoint.
-- **Cleanup** — Removes all deployed decoys (AD accounts + endpoint credentials + deployment record) in one command.
+- **Pass-the-Hash Trap** — Injects realistic cached credentials onto endpoint workstations via WinRM using `Start-Process -Credential`. Each decoy appears as a separate logon session with NTLM/SHA1 hashes in LSASS — indistinguishable from genuine credentials. When an attacker dumps and uses these credentials, it triggers a Wazuh alert.
+- **Cleanup** — Removes all deployed decoys (AD accounts + endpoint credentials + deployment record) and deletes the Wazuh CDB list file in one command.
 - **Dry-Run Mode** — Simulates the full deploy/cleanup workflow without making any changes.
 - **Idempotent** — Running deploy twice will not create duplicate accounts.
 
@@ -50,13 +49,12 @@ Honey_Token_Generator/
 
 ## Configuration
 
-The configuration file (`config.json`) has four sections:
+The configuration file (`config.json`) has three sections:
 
 | Section | Purpose |
 |---------|---------|
 | `domain_controller` | DC connection details: IP, domain name, LDAPS port, admin credentials, decoy OU path |
-| `deployment_settings` | `min_decoys_per_host` and `max_decoys_per_host` — controls randomization |
-| `decoys` | List of honey-token accounts to create: username, password, SPNs, description |
+| `decoys` | List of honey-token accounts to create: username, password, SPNs (optional — use an empty list for non-service accounts), description |
 | `endpoints` | List of workstations to inject credentials: IP, hostname, WinRM credentials |
 
 See `config.example.json` for a complete template.
@@ -80,11 +78,12 @@ python honey_token_gen.py deploy --config config.json --dry-run
 **What deploy does:**
 1. Connects to the Domain Controller via LDAPS
 2. Creates a Decoy OU (e.g., `OU=Decoys,DC=NTT,DC=local`)
-3. Randomly distributes decoys across endpoints
-4. For each assigned decoy:
+3. Deploys ALL decoys to ALL endpoints
+4. For each decoy on each endpoint:
    - Creates an AD user account with SPNs in the Decoy OU
    - Injects a cached credential on the target workstation via WinRM
 5. Writes `list.json` recording all deployed decoys and their workstation assignments
+6. Writes `honey_tokens` CDB list file for Wazuh
 
 ### Cleanup Decoys
 
@@ -103,10 +102,11 @@ python honey_token_gen.py cleanup --config config.json --dry-run
 **What cleanup does:**
 1. Reads `list.json` to determine what was deployed
 2. For each deployed decoy:
-   - Removes the cached credential from the workstation via WinRM
+   - Kills the holder process on the workstation (removing the logon session from LSASS)
    - Deletes the AD user account from the Decoy OU
 3. Deletes the Decoy OU if empty
 4. Deletes `list.json`
+5. Deletes `honey_tokens` (Wazuh CDB list)
 
 ### View Help
 
@@ -121,6 +121,7 @@ python honey_token_gen.py cleanup --help
 | File | Description |
 |------|-------------|
 | `list.json` | Deployment record — tracks deployed decoys and their workstation assignments. Created by `deploy`, deleted by `cleanup`. |
+| `honey_tokens` | Wazuh CDB list — contains honey-token usernames in key:value format for Wazuh monitoring rules. Created by `deploy`, deleted by `cleanup`. |
 | `honey_token_gen.log` | Detailed log file with DEBUG-level output for troubleshooting. |
 
 ## Troubleshooting
@@ -131,4 +132,3 @@ python honey_token_gen.py cleanup --help
 | `WinRM connection failed` | Ensure WinRM is enabled: run `winrm quickconfig` on the endpoint. |
 | `Permission denied on AD` | Verify the admin account has permissions to create users in the target OU. |
 | `Deployment record already exists` | Run `cleanup` before deploying again to avoid conflicts. |
-| `Decoy pool exhausted` | Add more decoy definitions to config, or reduce `max_decoys_per_host`. |

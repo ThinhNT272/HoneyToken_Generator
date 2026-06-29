@@ -55,7 +55,7 @@ def _validate_config(config: dict) -> None:
         ValueError: If any validation check fails.
     """
     # --- Root-level keys ---
-    required_root_keys = ["domain_controller", "deployment_settings", "decoys", "endpoints"]
+    required_root_keys = ["domain_controller", "decoys", "endpoints"]
     for key in required_root_keys:
         if key not in config:
             raise ValueError(f"Missing required top-level key: '{key}'")
@@ -67,32 +67,13 @@ def _validate_config(config: dict) -> None:
         if key not in dc:
             raise ValueError(f"Missing required domain_controller field: '{key}'")
 
-    # --- Deployment Settings section ---
-    settings = config["deployment_settings"]
-    if "min_decoys_per_host" not in settings or "max_decoys_per_host" not in settings:
-        raise ValueError("deployment_settings must contain 'min_decoys_per_host' and 'max_decoys_per_host'")
-
-    min_val = settings["min_decoys_per_host"]
-    max_val = settings["max_decoys_per_host"]
-
-    if not isinstance(min_val, int) or not isinstance(max_val, int):
-        raise ValueError("min_decoys_per_host and max_decoys_per_host must be integers")
-
-    if min_val < 1:
-        raise ValueError("min_decoys_per_host must be at least 1")
-
-    if min_val > max_val:
-        raise ValueError(
-            f"min_decoys_per_host ({min_val}) cannot be greater than max_decoys_per_host ({max_val})"
-        )
-
     # --- Decoys section ---
     if not isinstance(config["decoys"], list) or len(config["decoys"]) == 0:
         raise ValueError("'decoys' must be a non-empty list of decoy definitions")
 
     seen_usernames = set()
     for idx, decoy in enumerate(config["decoys"]):
-        for key in ["username", "password", "spns", "description"]:
+        for key in ["username", "password", "description"]:
             if key not in decoy:
                 raise ValueError(f"Decoy at index {idx} is missing required field '{key}'")
 
@@ -103,19 +84,17 @@ def _validate_config(config: dict) -> None:
             raise ValueError(f"Duplicate decoy username found: '{username}'")
         seen_usernames.add(username)
 
-        # Validate SPNs
-        if not isinstance(decoy["spns"], list):
-            raise ValueError(f"Decoy '{username}': 'spns' field must be a list")
+        # Validate SPNs (optional — missing or empty list is allowed)
+        if "spns" in decoy and decoy["spns"]:
+            if not isinstance(decoy["spns"], list):
+                raise ValueError(f"Decoy '{username}': 'spns' field must be a list")
 
-        if len(decoy["spns"]) == 0:
-            raise ValueError(f"Decoy '{username}': 'spns' list must contain at least one SPN")
-
-        for spn in decoy["spns"]:
-            if not SPN_PATTERN.match(spn):
-                raise ValueError(
-                    f"Decoy '{username}': Invalid SPN format '{spn}'. "
-                    f"Expected format: 'service/host' or 'service/host:port'"
-                )
+            for spn in decoy["spns"]:
+                if not SPN_PATTERN.match(spn):
+                    raise ValueError(
+                        f"Decoy '{username}': Invalid SPN format '{spn}'. "
+                        f"Expected format: 'service/host' or 'service/host:port'"
+                    )
 
     # --- Endpoints section ---
     if not isinstance(config["endpoints"], list) or len(config["endpoints"]) == 0:
@@ -126,14 +105,3 @@ def _validate_config(config: dict) -> None:
             if key not in endpoint:
                 raise ValueError(f"Endpoint at index {idx} is missing required field '{key}'")
 
-    # --- Pool size warning ---
-    num_endpoints = len(config["endpoints"])
-    num_decoys = len(config["decoys"])
-    max_needed = max_val * num_endpoints
-
-    if max_needed > num_decoys:
-        logger.warning(
-            f"Decoy pool may be insufficient: max_decoys_per_host ({max_val}) x "
-            f"endpoints ({num_endpoints}) = {max_needed}, but only {num_decoys} "
-            f"decoys are defined. Some hosts may receive fewer decoys than the maximum."
-        )

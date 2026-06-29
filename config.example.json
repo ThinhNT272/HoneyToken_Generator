@@ -2,15 +2,10 @@
   "domain_controller": {
     "ip": "192.168.100.50",
     "domain_name": "NTT.local",
-    "ldaps_port": 389,
+    "ldaps_port": 636,
     "admin_username": "NTT\\administrator",
     "admin_password": "DCAdminPassword123!",
     "decoy_ou": "OU=Decoys,DC=NTT,DC=local"
-  },
-
-  "deployment_settings": {
-    "min_decoys_per_host": 1,
-    "max_decoys_per_host": 2
   },
 
   "decoys": [
@@ -23,28 +18,24 @@
       "description": "SQL Database Service Account for Automated Backup"
     },
     {
-      "username": "sql-decoy2",
+      "username": "backup-svc",
       "password": "DecoyPassword456!",
       "spns": [
-        "MSSQLSvc/sql-decoy2.NTT.local:1433"
-      ],
-      "description": "SQL Reporting Service Account"
-    },
-    {
-      "username": "backup-admin",
-      "password": "DecoyBackupPass789!",
-      "spns": [
-        "HOST/backup-admin.NTT.local"
-      ],
-      "description": "Backup Administrator Account"
-    },
-    {
-      "username": "backup-user",
-      "password": "DecoyBackupPass101!",
-      "spns": [
-        "HOST/backup-user.NTT.local"
+        "HOST/backup-svc.NTT.local"
       ],
       "description": "Backup Service Account"
+    },
+    {
+      "username": "john.nguyen",
+      "password": "DecoyUserPass789!",
+      "spns": [],
+      "description": "IT Support Engineer"
+    },
+    {
+      "username": "admin.le",
+      "password": "DecoyAdminPass321!",
+      "spns": [],
+      "description": "System Administrator"
     }
   ],
 
