@@ -11,10 +11,11 @@ $TASK_PREFIX = "HoneyToken_"
 $CSharp = @"
 using System;using System.Runtime.InteropServices;
 public class Ls {
-[DllImport("advapi32.dll")]public static extern uint LsaOpenPolicy(IntPtr s,IntPtr o,uint a,out IntPtr h);
+[DllImport("advapi32.dll")]public static extern uint LsaOpenPolicy(IntPtr s,ref L_O o,uint a,out IntPtr h);
 [DllImport("advapi32.dll")]public static extern uint LsaAddAccountRights(IntPtr h,IntPtr sid,L_S[] r,uint c);
 [DllImport("advapi32.dll")]public static extern uint LsaClose(IntPtr h);
 [StructLayout(LayoutKind.Sequential)]public struct L_S {public ushort l;public ushort m;public IntPtr b;}
+[StructLayout(LayoutKind.Sequential)]public struct L_O {public uint l;public IntPtr r;public IntPtr n;public uint a;public IntPtr sd;public IntPtr sq;}
 }
 "@
 
@@ -32,9 +33,11 @@ function Grant-BatchLogonRight {
         $SidPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($SID.BinaryLength)
         [System.Runtime.InteropServices.Marshal]::Copy($sidBytes, 0, $SidPtr, $SID.BinaryLength)
 
+        $o = New-Object Ls+L_O
+        $o.l = [System.Runtime.InteropServices.Marshal]::SizeOf([Ls+L_O])
         $PolicyHandle = [IntPtr]::Zero
         $access = 0x000F0811
-        $res = [Ls]::LsaOpenPolicy([IntPtr]::Zero, [IntPtr]::Zero, $access, [ref]$PolicyHandle)
+        $res = [Ls]::LsaOpenPolicy([IntPtr]::Zero, [ref]$o, $access, [ref]$PolicyHandle)
         if ($res -ne 0) { throw "LsaOpenPolicy failed: $res" }
 
         $Right = "SeBatchLogonRight"
