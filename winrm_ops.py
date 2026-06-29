@@ -109,7 +109,8 @@ def inject_credential_decoy(session: winrm.Session, domain: str,
     # 3. Creates a Scheduled Task that runs as the decoy user
     #    (creates a Type 4 Batch logon session in LSASS with NTLM/SHA1 hashes)
     # 4. Starts the task immediately
-    # 5. Verifies the task is running    ps_script = f"""
+    # 5. Verifies the task is running
+    ps_script = f"""
 $ErrorActionPreference = 'Stop'
 $CSharp = @"
 using System;using System.Runtime.InteropServices;
