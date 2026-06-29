@@ -109,124 +109,55 @@ def inject_credential_decoy(session: winrm.Session, domain: str,
     # 3. Creates a Scheduled Task that runs as the decoy user
     #    (creates a Type 4 Batch logon session in LSASS with NTLM/SHA1 hashes)
     # 4. Starts the task immediately
-    # 5. Verifies the task is running
-    ps_script = f"""
+    # 5. Verifies the task is running    ps_script = f"""
 $ErrorActionPreference = 'Stop'
-
-# C# definition to access LsaAddAccountRights Win32 API
-$CSharpCode = @"
-using System;
-using System.Runtime.InteropServices;
-using System.Security.Principal;
-
-public class LsaHelper {{
-    [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
-    public static extern uint LsaOpenPolicy(IntPtr SystemName, IntPtr ObjectAttributes, uint DesiredAccess, out IntPtr PolicyHandle);
-
-    [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
-    public static extern uint LsaAddAccountRights(IntPtr PolicyHandle, IntPtr AccountSid, LSA_UNICODE_STRING[] UserRights, uint CountOfRights);
-
-    [DllImport("advapi32.dll")]
-    public static extern uint LsaClose(IntPtr PolicyHandle);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct LSA_UNICODE_STRING {{
-        public ushort Length;
-        public ushort MaximumLength;
-        public IntPtr Buffer;
-    }}
+$CSharp = @"
+using System;using System.Runtime.InteropServices;
+public class Ls {{
+[DllImport("advapi32.dll")]public static extern uint LsaOpenPolicy(IntPtr s,IntPtr o,uint a,out IntPtr h);
+[DllImport("advapi32.dll")]public static extern uint LsaAddAccountRights(IntPtr h,IntPtr sid,L_S[] r,uint c);
+[DllImport("advapi32.dll")]public static extern uint LsaClose(IntPtr h);
+[StructLayout(LayoutKind.Sequential)]public struct L_S {{public ushort l;public ushort m;public IntPtr b;}}
 }}
 "@
-
-if (-not ([System.Management.Automation.PSTypeName]"LsaHelper").Type) {{
-    Add-Type -TypeDefinition $CSharpCode
+if (-not ("Ls" -as [type])) {{Add-Type -TypeDefinition $CSharp}}
+function G-B($n) {{
+$a=New-Object System.Security.Principal.NTAccount($n)
+$s=$a.Translate([System.Security.Principal.SecurityIdentifier])
+$b=New-Object byte[] $s.BinaryLength
+$s.GetBinaryForm($b,0)
+$p=[System.Runtime.InteropServices.Marshal]::AllocHGlobal($s.BinaryLength)
+[System.Runtime.InteropServices.Marshal]::Copy($b,0,$p,$s.BinaryLength)
+$h=[IntPtr]::Zero
+[Ls]::LsaOpenPolicy([IntPtr]::Zero,[IntPtr]::Zero,0x000F0811,[ref]$h)
+$r=New-Object Ls+L_S
+$r.b=[System.Runtime.InteropServices.Marshal]::StringToHGlobalUni("SeBatchLogonRight")
+$r.l=[ushort]32
+$r.m=[ushort]34
+[void][Ls]::LsaAddAccountRights($h,$p,[Ls+L_S[]]@($r),1)
+[void][Ls]::LsaClose($h)
+[System.Runtime.InteropServices.Marshal]::FreeHGlobal($p)
+[System.Runtime.InteropServices.Marshal]::FreeHGlobal($r.b)
 }}
-
-function Grant-BatchLogonRight {{
-    param([string]$AccountName)
-    $Account = New-Object System.Security.Principal.NTAccount($AccountName)
-    $SID = $Account.Translate([System.Security.Principal.SecurityIdentifier])
-    
-    # Get binary form in byte array
-    $sidBytes = New-Object byte[] $SID.BinaryLength
-    $SID.GetBinaryForm($sidBytes, 0)
-    
-    # Copy to unmanaged memory pointer
-    $SidPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($SID.BinaryLength)
-    [System.Runtime.InteropServices.Marshal]::Copy($sidBytes, 0, $SidPtr, $SID.BinaryLength)
-
-    $PolicyHandle = [IntPtr]::Zero
-    # POLICY_LOOKUP_NAMES (0x00000800) | POLICY_CREATE_ACCOUNT (0x00000010)
-    # But usually MAXIMUM_ALLOWED (0x02000000) or standard ACCESS_MASK
-    # Standard read/write access to LSA policy:
-    $access = 0x000F0000 -bor 0x00000001 -bor 0x00000010 -bor 0x00000800
-    $res = [LsaHelper]::LsaOpenPolicy([IntPtr]::Zero, [IntPtr]::Zero, $access, [ref]$PolicyHandle)
-    if ($res -ne 0) {{ throw "LsaOpenPolicy failed: $res" }}
-
-    $Right = "SeBatchLogonRight"
-    $Privilege = New-Object LsaHelper+LSA_UNICODE_STRING
-    $Privilege.Buffer = [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($Right)
-    $Privilege.Length = [ushort]($Right.Length * 2)
-    $Privilege.MaximumLength = [ushort](($Right.Length + 1) * 2)
-
-    $res = [LsaHelper]::LsaAddAccountRights($PolicyHandle, $SidPtr, [LsaHelper+LSA_UNICODE_STRING[]]@($Privilege), 1)
-    [LsaHelper]::LsaClose($PolicyHandle)
-    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($SidPtr)
-    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($Privilege.Buffer)
-    
-    if ($res -ne 0) {{
-        throw "LsaAddAccountRights failed: $res"
-    }}
-}}
-
 try {{
-    $taskName = '{task_name}'
-    $runAsUser = '{user_principal}'
-
-    # Grant SeBatchLogonRight to the decoy user first so the Scheduled Task can run
-    Grant-BatchLogonRight -AccountName $runAsUser
-
-    # Remove existing task if present (idempotent re-deploy)
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-
-    # Create a Scheduled Task running as the decoy user.
-    # Using -User and -Password directly causes Windows to create
-    # a Batch logon session (Type 4) in LSASS with NTLM/SHA1 hashes.
-    $action = New-ScheduledTaskAction `
-        -Execute 'powershell.exe' `
-        -Argument '-WindowStyle Hidden -NoProfile -Command "while(`$true){{Start-Sleep 3600}}"'
-
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -RestartCount 3 `
-        -RestartInterval (New-TimeSpan -Minutes 1)
-
-    Register-ScheduledTask `
-        -TaskName $taskName `
-        -Action $action `
-        -Settings $settings `
-        -User $runAsUser `
-        -Password '{password}' `
-        -RunLevel Limited `
-        -ErrorAction Stop | Out-Null
-
-    # Start the task immediately to create the logon session
-    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
-
-    # Brief wait for the task to start, then verify
-    Start-Sleep -Seconds 2
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-
-    if ($task.State -eq 'Running') {{
-        Write-Output "SUCCESS: Credential injected for $runAsUser (Task: $taskName, State: Running)"
-    }} else {{
-        Write-Output "WARNING: Task created but state is '$($task.State)' for $runAsUser"
-    }}
+$taskName = '{task_name}'
+$runAsUser = '{user_principal}'
+G-B $runAsUser
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -NoProfile -Command "while(1){{Start-Sleep 3600}}"'
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings -User $runAsUser -Password '{password}' -RunLevel Limited -ErrorAction Stop | Out-Null
+Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+Start-Sleep -Seconds 2
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+if ($task.State -eq 'Running') {{
+Write-Output "SUCCESS: Credential injected for $runAsUser (Task: $taskName, State: Running)"
+}} else {{
+Write-Output "WARNING: Task created but state is '$($task.State)' for $runAsUser"
+}}
 }} catch {{
-    Write-Error "Failed to inject credential for {user_principal}: $_"
-    exit 1
+Write-Error "Failed to inject credential for {user_principal}: $_"
+exit 1
 }}
 """
 
