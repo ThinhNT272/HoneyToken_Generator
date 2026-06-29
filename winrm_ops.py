@@ -106,7 +106,7 @@ def inject_credential_decoy(session: winrm.Session, domain: str,
     # PowerShell script that:
     # 1. Removes any existing task with the same name (idempotent)
     # 2. Creates a Scheduled Task that runs as the decoy user
-    #    with -LogonType Password (creates a Type 4 Batch logon session)
+    #    (creates a Type 4 Batch logon session in LSASS with NTLM/SHA1 hashes)
     # 3. Starts the task immediately
     # 4. Verifies the task is running
     ps_script = f"""
@@ -120,16 +120,11 @@ try {{
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
     # Create a Scheduled Task running as the decoy user.
-    # -LogonType Password causes Windows to create a Batch logon
-    # session (Type 4) in LSASS with NTLM/SHA1 hashes.
+    # Using -User and -Password directly causes Windows to create
+    # a Batch logon session (Type 4) in LSASS with NTLM/SHA1 hashes.
     $action = New-ScheduledTaskAction `
         -Execute 'powershell.exe' `
         -Argument '-WindowStyle Hidden -NoProfile -Command "while(`$true){{Start-Sleep 3600}}"'
-
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId $runAsUser `
-        -LogonType Password `
-        -RunLevel Limited
 
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -141,9 +136,10 @@ try {{
     Register-ScheduledTask `
         -TaskName $taskName `
         -Action $action `
-        -Principal $principal `
         -Settings $settings `
+        -User $runAsUser `
         -Password '{password}' `
+        -RunLevel Limited `
         -ErrorAction Stop | Out-Null
 
     # Start the task immediately to create the logon session
@@ -152,7 +148,6 @@ try {{
     # Brief wait for the task to start, then verify
     Start-Sleep -Seconds 2
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-    $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
 
     if ($task.State -eq 'Running') {{
         Write-Output "SUCCESS: Credential injected for $runAsUser (Task: $taskName, State: Running)"
