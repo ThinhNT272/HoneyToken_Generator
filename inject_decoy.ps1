@@ -43,8 +43,8 @@ function Grant-BatchLogonRight {
         $Right = "SeBatchLogonRight"
         $r = New-Object Ls+L_S
         $r.b = [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($Right)
-        $r.l = [ushort]($Right.Length * 2)
-        $r.m = [ushort](($Right.Length + 1) * 2)
+        $r.l = [uint16]($Right.Length * 2)
+        $r.m = [uint16](($Right.Length + 1) * 2)
 
         $res = [Ls]::LsaAddAccountRights($PolicyHandle, $SidPtr, [Ls+L_S[]]@($r), 1)
         [void][Ls]::LsaClose($PolicyHandle)
