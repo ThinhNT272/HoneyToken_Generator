@@ -4,26 +4,27 @@ winrm_ops.py — WinRM Endpoint Operations
 Handles all interactions with Windows workstations via WinRM:
 - Establishing WinRM sessions
 - Injecting honey-token credentials as separate logon sessions
-- Removing honey-token credentials by killing their holder processes
+- Removing honey-token credentials by stopping and unregistering tasks
 
 Credential Injection Mechanism:
-    Each honey-token credential is injected by launching a hidden
-    background PowerShell process on the endpoint using
-    Start-Process -Credential. This creates a real Interactive
-    logon session (Type 2) in LSASS, causing each decoy to appear
-    as a separate session with NTLM/SHA1 hashes when dumped by
-    tools like Mimikatz — indistinguishable from genuine cached
-    credentials.
+    Each honey-token credential is injected by creating a Windows
+    Scheduled Task that runs under the decoy user's credentials.
+    When the task executes, Windows creates a real Batch logon
+    session (Type 4) in LSASS, causing each decoy to appear as
+    a separate session with NTLM/SHA1 hashes when dumped by tools
+    like Mimikatz — indistinguishable from genuine cached credentials.
 
-    The PID of each holder process is stored in a registry key
-    (HKLM:\SOFTWARE\HoneyTokens\<username>) so the cleanup
-    command can find and kill them later.
+    Each task is named 'HoneyToken_<username>' for deterministic
+    identification during cleanup.
 """
 
 import logging
 import winrm
 
 logger = logging.getLogger("honey_token_gen.winrm")
+
+# Prefix for all honey-token scheduled task names
+TASK_PREFIX = "HoneyToken_"
 
 
 def get_winrm_session(ip: str, username: str, password: str,
@@ -73,13 +74,12 @@ def inject_credential_decoy(session: winrm.Session, domain: str,
                             dry_run: bool = False) -> None:
     """Injects a honey-token credential as a real logon session on the endpoint.
 
-    Launches a hidden background PowerShell process running under the
-    decoy user's credentials via Start-Process -Credential. This causes
-    Windows to create a genuine Interactive logon session (Type 2) in
-    LSASS, complete with NTLM and SHA1 hashes.
+    Creates a Windows Scheduled Task that runs a hidden PowerShell
+    process under the decoy user's credentials. When the task starts,
+    Windows creates a Batch logon session (Type 4) in LSASS, complete
+    with NTLM and SHA1 hashes — each decoy gets its own session.
 
-    The holder process PID is saved to the registry at
-    HKLM:\SOFTWARE\HoneyTokens\<username> for later cleanup.
+    The task is named 'HoneyToken_<username>' for deterministic cleanup.
 
     Args:
         session: Active WinRM session to the endpoint.
@@ -92,45 +92,73 @@ def inject_credential_decoy(session: winrm.Session, domain: str,
         RuntimeError: If the credential injection fails.
     """
     user_principal = f"{domain}\\{username}"
+    task_name = f"{TASK_PREFIX}{username}"
 
     if dry_run:
         logger.info(
             f"[DRY-RUN] Would inject credential for '{user_principal}' "
-            f"via Start-Process -Credential"
+            f"via Scheduled Task '{task_name}'"
         )
         return
 
     logger.info(f"Injecting credential for '{user_principal}'")
 
     # PowerShell script that:
-    # 1. Creates a PSCredential object for the decoy user
-    # 2. Launches a hidden background process under that credential
-    #    (creates a Type 2 Interactive logon session in LSASS)
-    # 3. Saves the holder process PID to the registry for cleanup
+    # 1. Removes any existing task with the same name (idempotent)
+    # 2. Creates a Scheduled Task that runs as the decoy user
+    #    with -LogonType Password (creates a Type 4 Batch logon session)
+    # 3. Starts the task immediately
+    # 4. Verifies the task is running
     ps_script = f"""
 $ErrorActionPreference = 'Stop'
 
 try {{
-    # Build credential object for the decoy user
-    $secPass = ConvertTo-SecureString '{password}' -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential('{user_principal}', $secPass)
+    $taskName = '{task_name}'
+    $runAsUser = '{user_principal}'
 
-    # Launch a hidden background process under the decoy credential.
-    # This creates a real Interactive logon session (Type 2) in LSASS.
-    # The process sleeps indefinitely to keep the session alive.
-    $proc = Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList '-WindowStyle Hidden -NoProfile -Command "while(1){{Start-Sleep 3600}}"' `
-        -Credential $cred `
-        -PassThru -WindowStyle Hidden
+    # Remove existing task if present (idempotent re-deploy)
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
-    # Save the PID to registry so cleanup can find and kill it later
-    $regPath = 'HKLM:\\SOFTWARE\\HoneyTokens'
-    if (-not (Test-Path $regPath)) {{
-        New-Item -Path $regPath -Force | Out-Null
+    # Create a Scheduled Task running as the decoy user.
+    # -LogonType Password causes Windows to create a Batch logon
+    # session (Type 4) in LSASS with NTLM/SHA1 hashes.
+    $action = New-ScheduledTaskAction `
+        -Execute 'powershell.exe' `
+        -Argument '-WindowStyle Hidden -NoProfile -Command "while(`$true){{Start-Sleep 3600}}"'
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId $runAsUser `
+        -LogonType Password `
+        -RunLevel Limited
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Principal $principal `
+        -Settings $settings `
+        -Password '{password}' `
+        -ErrorAction Stop | Out-Null
+
+    # Start the task immediately to create the logon session
+    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+
+    # Brief wait for the task to start, then verify
+    Start-Sleep -Seconds 2
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+
+    if ($task.State -eq 'Running') {{
+        Write-Output "SUCCESS: Credential injected for $runAsUser (Task: $taskName, State: Running)"
+    }} else {{
+        Write-Output "WARNING: Task created but state is '$($task.State)' for $runAsUser"
     }}
-    Set-ItemProperty -Path $regPath -Name '{username}' -Value $proc.Id -Type DWord
-
-    Write-Output "SUCCESS: Credential injected for {user_principal} (PID: $($proc.Id))"
 }} catch {{
     Write-Error "Failed to inject credential for {user_principal}: $_"
     exit 1
@@ -150,12 +178,11 @@ try {{
 
 def remove_credential_decoy(session: winrm.Session, domain: str,
                             username: str, dry_run: bool = False) -> None:
-    """Removes a honey-token credential by killing its holder process.
+    """Removes a honey-token credential by stopping and unregistering its task.
 
-    Reads the holder process PID from the registry at
-    HKLM:\SOFTWARE\HoneyTokens\<username>, kills the process
-    (which destroys the logon session and purges credentials from
-    LSASS), then removes the registry entry.
+    Stops the Scheduled Task 'HoneyToken_<username>' (which kills
+    the holder process and destroys the logon session, purging
+    credentials from LSASS), then unregisters the task entirely.
 
     Args:
         session: Active WinRM session to the endpoint.
@@ -163,58 +190,44 @@ def remove_credential_decoy(session: winrm.Session, domain: str,
         username: Honey-token username (e.g., 'sql-decoy').
         dry_run: If True, simulate without modifying the endpoint.
     """
+    task_name = f"{TASK_PREFIX}{username}"
+
     if dry_run:
         logger.info(
             f"[DRY-RUN] Would remove credential for '{domain}\\{username}' "
-            f"by killing holder process"
+            f"by stopping task '{task_name}'"
         )
         return
 
     logger.info(f"Removing credential for '{domain}\\{username}'")
 
     # PowerShell script that:
-    # 1. Reads the holder process PID from registry
-    # 2. Kills the process (destroys the logon session)
-    # 3. Removes the registry entry
+    # 1. Stops the scheduled task (kills the process, destroys logon session)
+    # 2. Unregisters the task entirely
     ps_script = f"""
 $ErrorActionPreference = 'SilentlyContinue'
-$regPath = 'HKLM:\\SOFTWARE\\HoneyTokens'
+$taskName = '{task_name}'
 
-# Read the PID from registry
-$pid = Get-ItemProperty -Path $regPath -Name '{username}' -ErrorAction SilentlyContinue
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 
-if ($pid) {{
-    $processId = $pid.'{username}'
-
-    # Kill the holder process to destroy the logon session
-    $proc = Get-Process -Id $processId -ErrorAction SilentlyContinue
-    if ($proc) {{
-        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
-        Write-Output "SUCCESS: Killed holder process (PID: $processId) for '{username}'"
-    }} else {{
-        Write-Output "WARNING: Holder process (PID: $processId) for '{username}' not found (may have already exited)"
+if ($task) {{
+    # Stop the task (kills the holder process and destroys the logon session)
+    if ($task.State -eq 'Running') {{
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     }}
 
-    # Remove the registry entry
-    Remove-ItemProperty -Path $regPath -Name '{username}' -ErrorAction SilentlyContinue
+    # Unregister the task
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Output "SUCCESS: Removed task '$taskName' for '{username}'"
 }} else {{
-    Write-Output "WARNING: No registry entry found for '{username}' (credential may have already been removed)"
-}}
-
-# Clean up registry key if no more entries remain
-$remaining = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
-if ($remaining) {{
-    $props = $remaining.PSObject.Properties | Where-Object {{ $_.Name -notlike 'PS*' }}
-    if (-not $props) {{
-        Remove-Item -Path $regPath -Force -ErrorAction SilentlyContinue
-    }}
+    Write-Output "WARNING: Task '$taskName' not found (credential may have already been removed)"
 }}
 """
 
     status, stdout, stderr = _run_ps(session, ps_script)
 
     if status != 0:
-        # Non-zero is acceptable — credential might already be removed (idempotent)
+        # Non-zero is acceptable — task might already be removed (idempotent)
         logger.warning(
             f"Credential removal returned exit code {status} for '{username}'. "
             f"The credential may already have been removed. stderr: {stderr}"
