@@ -104,17 +104,87 @@ def inject_credential_decoy(session: winrm.Session, domain: str,
     logger.info(f"Injecting credential for '{user_principal}'")
 
     # PowerShell script that:
-    # 1. Removes any existing task with the same name (idempotent)
-    # 2. Creates a Scheduled Task that runs as the decoy user
+    # 1. Grants the decoy user SeBatchLogonRight using Local Security Authority (LSA) Win32 APIs
+    # 2. Removes any existing task with the same name (idempotent)
+    # 3. Creates a Scheduled Task that runs as the decoy user
     #    (creates a Type 4 Batch logon session in LSASS with NTLM/SHA1 hashes)
-    # 3. Starts the task immediately
-    # 4. Verifies the task is running
+    # 4. Starts the task immediately
+    # 5. Verifies the task is running
     ps_script = f"""
 $ErrorActionPreference = 'Stop'
+
+# C# definition to access LsaAddAccountRights Win32 API
+$CSharpCode = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+
+public class LsaHelper {{
+    [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
+    public static extern uint LsaOpenPolicy(IntPtr SystemName, IntPtr ObjectAttributes, uint DesiredAccess, out IntPtr PolicyHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
+    public static extern uint LsaAddAccountRights(IntPtr PolicyHandle, IntPtr AccountSid, LSA_UNICODE_STRING[] UserRights, uint CountOfRights);
+
+    [DllImport("advapi32.dll")]
+    public static extern uint LsaClose(IntPtr PolicyHandle);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LSA_UNICODE_STRING {{
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }}
+}}
+"@
+
+if (-not ([System.Management.Automation.PSTypeName]"LsaHelper").Type) {{
+    Add-Type -TypeDefinition $CSharpCode
+}}
+
+function Grant-BatchLogonRight {{
+    param([string]$AccountName)
+    $Account = New-Object System.Security.Principal.NTAccount($AccountName)
+    $SID = $Account.Translate([System.Security.Principal.SecurityIdentifier])
+    
+    # Get binary form in byte array
+    $sidBytes = New-Object byte[] $SID.BinaryLength
+    $SID.GetBinaryForm($sidBytes, 0)
+    
+    # Copy to unmanaged memory pointer
+    $SidPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($SID.BinaryLength)
+    [System.Runtime.InteropServices.Marshal]::Copy($sidBytes, 0, $SidPtr, $SID.BinaryLength)
+
+    $PolicyHandle = [IntPtr]::Zero
+    # POLICY_LOOKUP_NAMES (0x00000800) | POLICY_CREATE_ACCOUNT (0x00000010)
+    # But usually MAXIMUM_ALLOWED (0x02000000) or standard ACCESS_MASK
+    # Standard read/write access to LSA policy:
+    $access = 0x000F0000 -bor 0x00000001 -bor 0x00000010 -bor 0x00000800
+    $res = [LsaHelper]::LsaOpenPolicy([IntPtr]::Zero, [IntPtr]::Zero, $access, [ref]$PolicyHandle)
+    if ($res -ne 0) {{ throw "LsaOpenPolicy failed: $res" }}
+
+    $Right = "SeBatchLogonRight"
+    $Privilege = New-Object LsaHelper+LSA_UNICODE_STRING
+    $Privilege.Buffer = [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($Right)
+    $Privilege.Length = [ushort]($Right.Length * 2)
+    $Privilege.MaximumLength = [ushort](($Right.Length + 1) * 2)
+
+    $res = [LsaHelper]::LsaAddAccountRights($PolicyHandle, $SidPtr, [LsaHelper+LSA_UNICODE_STRING[]]@($Privilege), 1)
+    [LsaHelper]::LsaClose($PolicyHandle)
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($SidPtr)
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($Privilege.Buffer)
+    
+    if ($res -ne 0) {{
+        throw "LsaAddAccountRights failed: $res"
+    }}
+}}
 
 try {{
     $taskName = '{task_name}'
     $runAsUser = '{user_principal}'
+
+    # Grant SeBatchLogonRight to the decoy user first so the Scheduled Task can run
+    Grant-BatchLogonRight -AccountName $runAsUser
 
     # Remove existing task if present (idempotent re-deploy)
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue

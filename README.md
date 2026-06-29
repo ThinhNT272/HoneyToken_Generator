@@ -124,6 +124,18 @@ python honey_token_gen.py cleanup --help
 | `honey_tokens` | Wazuh CDB list — contains honey-token usernames in key:value format for Wazuh monitoring rules. Created by `deploy`, deleted by `cleanup`. |
 | `honey_token_gen.log` | Detailed log file with DEBUG-level output for troubleshooting. |
 
+## Wazuh Alerts
+
+The generated `honey_tokens` file can be used directly as a Wazuh CDB list.
+Ready-to-use manager rules, Windows agent collection configuration, and
+deployment instructions are available in [`../Wazuh/README.md`](../Wazuh/README.md).
+
+The supplied rules generate:
+
+- Event 4624 (network logon through NTLM) with a decoy `targetUserName`:
+  **Nghi vấn PtH attack**
+- Event 4769 with a decoy `serviceName`: **Nghi vấn Kerberoasting attack**
+
 ## Troubleshooting
 
 | Issue | Solution |
