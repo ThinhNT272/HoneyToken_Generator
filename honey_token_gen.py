@@ -1,50 +1,38 @@
 """
-honey_token_gen.py — Honey Token Generator CLI
+honey_token_gen.py — Honey Token Generator CLI (GPO & AD Native)
 
-Main entry point for the application. Provides two commands:
-- deploy: Creates honey-token accounts in AD and injects cached credentials on endpoints
-- cleanup: Removes all deployed honey-tokens and cleans up the environment
+Main entry point for the application. Designed to run natively on the DC.
+Commands:
+- deploy: Creates local AD accounts and GPOs, copies files to public share
+- cleanup: Removes AD accounts, GPOs, and shared files
 
 Usage:
-    python honey_token_gen.py deploy --config config.json [--dry-run]
-    python honey_token_gen.py cleanup --config config.json [--dry-run]
-    python honey_token_gen.py --help
+    python honey_token_gen.py deploy --config config.json
+    python honey_token_gen.py cleanup --config config.json
 """
 
 import os
 import sys
 import json
-
+import shutil
 import logging
 import argparse
+import subprocess
 from datetime import datetime
 
 from config import load_config
-from ldap_ops import (
-    get_connection,
-    create_ou_if_not_exists,
-    deploy_ldap_decoy,
-    cleanup_ldap_decoy,
-    delete_ou_if_empty,
-)
-from winrm_ops import (
-    get_winrm_session,
-    inject_credential_decoy,
-    remove_credential_decoy,
-)
+from gpo_ops import create_or_configure_gpo, remove_gpo
 
 # --- Constants ---
 LIST_FILE = "list.json"
 CDB_FILE = "honey_tokens"
 LOG_FILE = "honey_token_gen.log"
+CLIENT_SCRIPT_NAME = "inject_decoy.ps1"
+CONFIG_SHARE_NAME = "decoys.json"
 
 
 def setup_logging() -> None:
-    """Configures logging to output to both console and a log file.
-
-    Console shows INFO level and above.
-    Log file captures DEBUG level and above for troubleshooting.
-    """
+    """Configures logging to output to both console and a log file."""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
 
@@ -56,7 +44,7 @@ def setup_logging() -> None:
     )
     console_handler.setFormatter(console_format)
 
-    # File handler — DEBUG level for detailed troubleshooting
+    # File handler — DEBUG level
     file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_format = logging.Formatter(
@@ -71,228 +59,237 @@ def setup_logging() -> None:
 logger = logging.getLogger("honey_token_gen")
 
 
+def _run_ps_cmd(cmd: str) -> tuple[int, str, str]:
+    """Runs a PowerShell command locally on the Domain Controller."""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def parse_dn(dn: str) -> tuple[str, str]:
+    """Parses a DN (like OU=Decoys,DC=NTT,DC=local) into (Name, ParentPath)."""
+    parts = dn.split(",")
+    name = parts[0].split("=")[1]
+    parent = ",".join(parts[1:])
+    return name, parent
+
+
 def cmd_deploy(args: argparse.Namespace) -> None:
-    """Orchestrates the full deployment workflow.
-
-    1. Loads config
-    2. Connects to DC via LDAP
-    3. Creates decoy OU
-    4. Deploys all decoys to all endpoints
-    5. For each endpoint: create AD accounts + inject credentials
-    6. Writes list.json and honey_tokens (CDB list) output files
-
-    Args:
-        args: Parsed CLI arguments (config path, dry-run flag).
-    """
+    """Orchestrates the GPO-based deployment workflow."""
     config_path = args.config
-    dry_run = args.dry_run
 
     logger.info("=" * 60)
-    logger.info(f"DEPLOY started (dry-run: {dry_run})")
+    logger.info("DEPLOY started (GPO & AD Native)")
     logger.info("=" * 60)
 
-    # --- Load configuration ---
     try:
         config = load_config(config_path)
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         sys.exit(1)
 
-    dc_config = config["domain_controller"]
+    ds = config["domain_settings"]
+    ss = config["share_settings"]
     decoys_pool = config["decoys"]
-    endpoints = config["endpoints"]
 
     # --- Check if a deployment already exists ---
-    if os.path.exists(LIST_FILE) and not dry_run:
+    if os.path.exists(LIST_FILE):
         logger.error(
             f"Deployment record '{LIST_FILE}' already exists. "
             f"Please run 'cleanup' first before deploying again."
         )
         sys.exit(1)
 
-    # --- Connect to Active Directory ---
-    ldap_conn = None
-    try:
-        if not dry_run:
-            ldap_conn = get_connection(
-                ip=dc_config["ip"],
-                domain=dc_config["domain_name"],
-                admin_username=dc_config["admin_username"],
-                admin_password=dc_config["admin_password"],
-                port=dc_config["ldaps_port"],
-            )
-        else:
-            logger.info("[DRY-RUN] Simulating LDAP connection to DC")
-    except Exception as e:
-        logger.error(f"Failed to connect to Domain Controller via LDAP: {e}")
-        sys.exit(1)
+    # --- 1. Create Decoy OU in Active Directory ---
+    ou_name, ou_parent = parse_dn(ds["decoy_ou"])
+    logger.info(f"Ensuring Decoy OU exists: '{ds['decoy_ou']}'...")
+    
+    ou_check_cmd = f"Get-ADOrganizationalUnit -Identity '{ds['decoy_ou']}' -ErrorAction SilentlyContinue"
+    code, stdout, stderr = _run_ps_cmd(ou_check_cmd)
+    
+    if code != 0:
+        # Create OU
+        create_ou_cmd = f"New-ADOrganizationalUnit -Name '{ou_name}' -Path '{ou_parent}'"
+        code, stdout, stderr = _run_ps_cmd(create_ou_cmd)
+        if code != 0:
+            logger.error(f"Failed to create Decoy OU: {stderr}")
+            sys.exit(1)
+        logger.info("Decoy OU created successfully.")
+    else:
+        logger.info("Decoy OU already exists.")
 
-    # --- Create Decoy OU ---
-    try:
-        create_ou_if_not_exists(ldap_conn, dc_config["decoy_ou"], dry_run=dry_run)
-    except Exception as e:
-        logger.error(f"Failed to create Decoy OU: {e}")
-        sys.exit(1)
-
-    # --- Create all AD accounts first (idempotent) ---
-    stats = {"ad_success": 0, "ad_fail": 0, "cred_success": 0, "cred_fail": 0}
-    ad_created = set()  # Track which accounts were successfully created
+    # --- 2. Deploy AD User Accounts ---
+    stats = {"ad_success": 0, "ad_fail": 0}
+    ad_created = set()
 
     for decoy in decoys_pool:
         username = decoy["username"]
-        try:
-            deploy_ldap_decoy(
-                conn=ldap_conn,
-                decoy=decoy,
-                decoy_ou=dc_config["decoy_ou"],
-                domain_name=dc_config["domain_name"],
-                dry_run=dry_run,
+        password = decoy["password"]
+        description = decoy["description"]
+        spns = decoy.get("spns", [])
+
+        logger.info(f"Deploying AD account '{username}'...")
+        
+        # Check if user exists
+        user_check_cmd = f"Get-ADUser -Filter \"SamAccountName -eq '{username}'\" -ErrorAction SilentlyContinue"
+        code, stdout, stderr = _run_ps_cmd(user_check_cmd)
+        
+        if code != 0:
+            # Create user
+            create_user_cmd = (
+                f"$secPass = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
+                f"New-ADUser -Name '{username}' -SamAccountName '{username}' -AccountPassword $secPass "
+                f"-Enabled $true -Path '{ds['decoy_ou']}' -Description '{description}'"
             )
-            stats["ad_success"] += 1
-            ad_created.add(username)
-        except Exception as e:
-            logger.error(
-                f"Failed to deploy '{username}' to AD: {e}. "
-                f"Skipping credential injection for this decoy."
-            )
-            stats["ad_fail"] += 1
-
-    # --- Inject credentials on all endpoints ---
-    deployed_decoys = []
-
-    for endpoint in endpoints:
-        hostname = endpoint["hostname"]
-        ip = endpoint["ip"]
-
-        logger.info(f"--- Processing host '{hostname}' ({ip}) ---")
-
-        # Connect to endpoint via WinRM
-        winrm_sess = None
-        try:
-            if not dry_run:
-                winrm_sess = get_winrm_session(
-                    ip=ip,
-                    username=endpoint["winrm_username"],
-                    password=endpoint["winrm_password"],
-                    transport=endpoint["winrm_transport"],
-                )
-            else:
-                logger.info(f"[DRY-RUN] Simulating WinRM connection to '{hostname}'")
-        except Exception as e:
-            logger.error(
-                f"Failed to connect to '{hostname}' via WinRM: {e}. "
-                f"Skipping all decoys for this host."
-            )
-            stats["cred_fail"] += len(decoys_pool)
-            continue
-
-        # Inject all decoys that were successfully created in AD
-        for decoy in decoys_pool:
-            username = decoy["username"]
-
-            # Skip decoys that failed AD creation
-            if username not in ad_created:
+            code, stdout, stderr = _run_ps_cmd(create_user_cmd)
+            if code != 0:
+                logger.error(f"Failed to create decoy account '{username}': {stderr}")
+                stats["ad_fail"] += 1
                 continue
+            logger.info(f"Decoy account '{username}' created successfully.")
+        else:
+            # Update description if user exists
+            update_user_cmd = f"Set-ADUser -Identity '{username}' -Description '{description}'"
+            _run_ps_cmd(update_user_cmd)
+            logger.info(f"Decoy account '{username}' already exists. Updated description.")
 
-            try:
-                inject_credential_decoy(
-                    session=winrm_sess,
-                    domain=dc_config["domain_name"],
-                    username=username,
-                    password=decoy["password"],
-                    dry_run=dry_run,
-                )
-                stats["cred_success"] += 1
+        # Assign SPNs if any
+        if spns:
+            spn_list = ",".join([f"'{s}'" for s in spns])
+            spn_cmd = f"Set-ADUser -Identity '{username}' -ServicePrincipalNames @({spn_list})"
+            code, stdout, stderr = _run_ps_cmd(spn_cmd)
+            if code != 0:
+                logger.warning(f"Failed to assign SPNs to '{username}': {stderr}")
+            else:
+                logger.info(f"Assigned SPNs to '{username}': {spns}")
+        else:
+            # Clear SPNs
+            _run_ps_cmd(f"Set-ADUser -Identity '{username}' -ServicePrincipalNames $null")
 
-                # Record successful deployment
-                deployed_decoys.append({
-                    "username": username,
-                    "spns": decoy.get("spns", []),
-                    "description": decoy["description"],
-                    "workstation": hostname,
-                })
-            except Exception as e:
-                logger.error(
-                    f"Failed to inject credential for '{username}' on '{hostname}': {e}"
-                )
-                stats["cred_fail"] += 1
+        stats["ad_success"] += 1
+        ad_created.add(username)
 
-    # --- Write deployment record (list.json) ---
-    if not dry_run:
-        now = datetime.now()
-        output_data = {
-            "deployment_id": now.strftime("%Y%m%d_%H%M%S"),
-            "domain": dc_config["domain_name"],
-            "deployed_at": now.isoformat(),
-            "decoys": deployed_decoys,
-        }
+    # --- 3. Copy injection script and write decoys.json to Custom Public Share ---
+    local_share_path = ss["local_path"]
+    logger.info(f"Ensuring local share directory exists: '{local_share_path}'...")
+    os.makedirs(local_share_path, exist_ok=True)
 
-        try:
-            with open(LIST_FILE, "w") as f:
-                json.dump(output_data, f, indent=2)
-            logger.info(f"Deployment record written to '{LIST_FILE}'")
-        except Exception as e:
-            logger.error(f"Failed to write deployment record: {e}")
-
-        # --- Write CDB list for Wazuh (unique usernames only) ---
-        try:
-            seen = set()
-            cdb_lines = []
-            for decoy in deployed_decoys:
-                if decoy["username"] not in seen:
-                    seen.add(decoy["username"])
-                    cdb_lines.append(f"{decoy['username']}:{decoy['description']}")
-
-            with open(CDB_FILE, "w") as f:
-                f.write("\n".join(cdb_lines) + "\n")
-            logger.info(f"Wazuh CDB list written to '{CDB_FILE}'")
-        except Exception as e:
-            logger.error(f"Failed to write CDB list: {e}")
+    # Copy inject_decoy.ps1 from repository to share
+    repo_script_path = os.path.join(os.path.dirname(__file__), CLIENT_SCRIPT_NAME)
+    dest_script_path = os.path.join(local_share_path, CLIENT_SCRIPT_NAME)
+    
+    if os.path.exists(repo_script_path):
+        logger.info(f"Copying '{CLIENT_SCRIPT_NAME}' to '{local_share_path}'...")
+        shutil.copy(repo_script_path, dest_script_path)
     else:
-        logger.info(
-            f"[DRY-RUN] Would write deployment record to '{LIST_FILE}' "
-            f"containing {len(deployed_decoys)} decoy(s)"
-        )
-        logger.info(
-            f"[DRY-RUN] Would write Wazuh CDB list to '{CDB_FILE}'"
-        )
+        logger.error(f"Client script '{CLIENT_SCRIPT_NAME}' not found in repo directory!")
+        sys.exit(1)
 
-    # --- Print summary ---
+    # Filter out successfully created decoys and save to decoys.json on share
+    active_decoys = [d for d in decoys_pool if d["username"] in ad_created]
+    decoys_json_data = {
+        "decoys": [
+            {
+                "username": d["username"],
+                "password": d["password"]
+            } for d in active_decoys
+        ]
+    }
+    
+    dest_json_path = os.path.join(local_share_path, CONFIG_SHARE_NAME)
+    logger.info(f"Writing deployment configuration to '{dest_json_path}'...")
+    try:
+        with open(dest_json_path, "w") as f:
+            json.dump(decoys_json_data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to write configuration to share: {e}")
+        sys.exit(1)
+
+    # --- 4. Configure GPO ---
+    network_script_path = f"{ss['network_path']}\\{CLIENT_SCRIPT_NAME}"
+    network_config_path = f"{ss['network_path']}\\{CONFIG_SHARE_NAME}"
+    
+    # Format script execution command
+    # E.g., \\DC01\Public\inject_decoy.ps1 -DecoyConfigPath \\DC01\Public\decoys.json
+    full_script_path = f"powershell.exe"
+    # Escaping arguments for the registry scripts.ini
+    full_script_args = f"-NonInteractive -NoProfile -ExecutionPolicy Bypass -File {network_script_path} -DecoyConfigPath {network_config_path}"
+    
+    try:
+        create_or_configure_gpo(
+            domain_name=ds["domain_name"],
+            decoy_ou_dn=ds["decoy_ou"],
+            gpo_name=ds["gpo_name"],
+            target_ou_dn=ds["target_ou_dn"],
+            network_script_path=network_script_path
+        )
+    except Exception as e:
+        logger.error(f"Failed to create/configure GPO: {e}")
+        sys.exit(1)
+
+    # --- 5. Write local deployment record (list.json) ---
+    now = datetime.now()
+    output_record = {
+        "deployment_id": now.strftime("%Y%m%d_%H%M%S"),
+        "domain": ds["domain_name"],
+        "gpo_name": ds["gpo_name"],
+        "deployed_at": now.isoformat(),
+        "share_local_path": local_share_path,
+        "decoys": [
+            {
+                "username": d["username"],
+                "spns": d.get("spns", []),
+                "description": d["description"]
+            } for d in active_decoys
+        ]
+    }
+
+    try:
+        with open(LIST_FILE, "w") as f:
+            json.dump(output_record, f, indent=2)
+        logger.info(f"Deployment record written to local '{LIST_FILE}'")
+    except Exception as e:
+        logger.error(f"Failed to write deployment record: {e}")
+
+    # --- 6. Write local CDB list for Wazuh ---
+    try:
+        seen = set()
+        cdb_lines = []
+        for decoy in active_decoys:
+            if decoy["username"] not in seen:
+                seen.add(decoy["username"])
+                cdb_lines.append(f"{decoy['username']}:{decoy['description']}")
+
+        with open(CDB_FILE, "w") as f:
+            f.write("\n".join(cdb_lines) + "\n")
+        logger.info(f"Wazuh CDB list written to local '{CDB_FILE}'")
+    except Exception as e:
+        logger.error(f"Failed to write Wazuh CDB list: {e}")
+
+    # --- Print Summary ---
     logger.info("=" * 60)
     logger.info("DEPLOY SUMMARY")
-    logger.info(f"  AD accounts created:         {stats['ad_success']}")
-    logger.info(f"  AD accounts failed:          {stats['ad_fail']}")
-    logger.info(f"  Credentials injected:        {stats['cred_success']}")
-    logger.info(f"  Credentials failed:          {stats['cred_fail']}")
-    logger.info(f"  Total decoys deployed:       {len(deployed_decoys)}")
+    logger.info(f"  AD accounts deployed:       {stats['ad_success']}")
+    logger.info(f"  AD accounts failed:         {stats['ad_fail']}")
+    logger.info(f"  Total decoys configured:    {len(active_decoys)}")
+    logger.info(f"  Workstation config share:   {network_config_path}")
     logger.info("=" * 60)
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:
-    """Orchestrates the full cleanup workflow.
-
-    1. Reads list.json to determine what was deployed
-    2. Loads config for connection credentials
-    3. For each deployed decoy: removes cached credential + deletes AD account
-    4. Deletes the Decoy OU if empty
-    5. Deletes list.json
-
-    Args:
-        args: Parsed CLI arguments (config path, dry-run flag).
-    """
+    """Orchestrates the GPO-based cleanup workflow."""
     config_path = args.config
-    dry_run = args.dry_run
 
     logger.info("=" * 60)
-    logger.info(f"CLEANUP started (dry-run: {dry_run})")
+    logger.info("CLEANUP started (GPO & AD Native)")
     logger.info("=" * 60)
 
-    # --- Load deployment record ---
     if not os.path.exists(LIST_FILE):
-        logger.warning(
-            f"Deployment record '{LIST_FILE}' not found. "
-            f"No deployed decoys to clean up."
-        )
+        logger.warning(f"Deployment record '{LIST_FILE}' not found. Nothing to clean up.")
         sys.exit(1)
 
     try:
@@ -303,207 +300,116 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     deployed_decoys = list_data.get("decoys", [])
-    if not deployed_decoys:
-        logger.info("No decoys found in deployment record. Nothing to clean up.")
-        sys.exit(0)
+    local_share_path = list_data.get("share_local_path", "C:\\Shares\\Public")
+    gpo_name = list_data.get("gpo_name", "HoneyToken_GPO")
 
-    logger.info(f"Found {len(deployed_decoys)} deployed decoy(s) to clean up")
-
-    # --- Load configuration ---
     try:
         config = load_config(config_path)
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         sys.exit(1)
 
-    dc_config = config["domain_controller"]
-    endpoints_map = {ep["hostname"]: ep for ep in config["endpoints"]}
+    ds = config["domain_settings"]
 
-    # --- Connect to Active Directory ---
-    ldap_conn = None
+    # --- 1. Empty/Remove decoys.json on Share first ---
+    # This signals workstations to immediately delete their scheduled tasks on next GPO run/startup
+    json_share_path = os.path.join(local_share_path, CONFIG_SHARE_NAME)
+    if os.path.exists(json_share_path):
+        logger.info(f"Clearing configuration in '{json_share_path}' to trigger workstation cleanup...")
+        try:
+            # Write empty decoys list to trigger automatic cleanup on endpoints
+            with open(json_share_path, "w") as f:
+                json.dump({"decoys": []}, f, indent=2)
+            logger.info("Workstation config share cleared.")
+        except Exception as e:
+            logger.warning(f"Failed to clear configuration share: {e}")
+
+    # --- 2. Remove GPO ---
     try:
-        if not dry_run:
-            ldap_conn = get_connection(
-                ip=dc_config["ip"],
-                domain=dc_config["domain_name"],
-                admin_username=dc_config["admin_username"],
-                admin_password=dc_config["admin_password"],
-                port=dc_config["ldaps_port"],
-            )
-        else:
-            logger.info("[DRY-RUN] Simulating LDAP connection to DC")
+        remove_gpo(gpo_name)
     except Exception as e:
-        logger.error(f"Failed to connect to Domain Controller via LDAP: {e}")
-        sys.exit(1)
+        logger.error(f"Failed to remove GPO '{gpo_name}': {e}")
 
-    # --- Clean up each deployed decoy ---
-    # Cache WinRM sessions to avoid reconnecting for every decoy on the same host
-    winrm_sessions = {}
-    stats = {"cred_success": 0, "cred_fail": 0, "ad_success": 0, "ad_fail": 0}
-
+    # --- 3. Remove AD Accounts ---
+    stats = {"ad_success": 0, "ad_fail": 0}
     for decoy in deployed_decoys:
         username = decoy["username"]
-        hostname = decoy["workstation"]
-
-        logger.info(f"--- Cleaning up decoy '{username}' from '{hostname}' ---")
-
-        # Step 1: Remove cached credential from endpoint via WinRM
-        if hostname in endpoints_map:
-            endpoint = endpoints_map[hostname]
-
-            # Connect if not already connected
-            if hostname not in winrm_sessions:
-                try:
-                    if not dry_run:
-                        winrm_sessions[hostname] = get_winrm_session(
-                            ip=endpoint["ip"],
-                            username=endpoint["winrm_username"],
-                            password=endpoint["winrm_password"],
-                            transport=endpoint["winrm_transport"],
-                        )
-                    else:
-                        winrm_sessions[hostname] = None
-                        logger.info(
-                            f"[DRY-RUN] Simulating WinRM connection to '{hostname}'"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to connect to '{hostname}' via WinRM: {e}"
-                    )
-                    winrm_sessions[hostname] = None
-
-            session = winrm_sessions[hostname]
-            if session or dry_run:
-                try:
-                    remove_credential_decoy(
-                        session=session,
-                        domain=dc_config["domain_name"],
-                        username=username,
-                        dry_run=dry_run,
-                    )
-                    stats["cred_success"] += 1
-                except Exception as e:
-                    logger.error(
-                        f"Failed to remove credential for '{username}' "
-                        f"on '{hostname}': {e}"
-                    )
-                    stats["cred_fail"] += 1
-            else:
-                logger.warning(
-                    f"No WinRM session available for '{hostname}' — "
-                    f"skipping credential removal for '{username}'"
-                )
-                stats["cred_fail"] += 1
-        else:
-            logger.warning(
-                f"Endpoint '{hostname}' not found in config — "
-                f"skipping credential removal for '{username}'"
-            )
-            stats["cred_fail"] += 1
-
-        # Step 2: Delete AD account via LDAP
-        try:
-            cleanup_ldap_decoy(
-                conn=ldap_conn,
-                username=username,
-                decoy_ou=dc_config["decoy_ou"],
-                dry_run=dry_run,
-            )
-            stats["ad_success"] += 1
-        except Exception as e:
-            logger.error(f"Failed to delete AD account '{username}': {e}")
+        logger.info(f"Removing decoy AD account '{username}'...")
+        remove_user_cmd = f"Remove-ADUser -Identity '{username}' -Confirm:$false -ErrorAction SilentlyContinue"
+        code, stdout, stderr = _run_ps_cmd(remove_user_cmd)
+        if code != 0:
+            logger.warning(f"Failed to remove AD account '{username}': {stderr}")
             stats["ad_fail"] += 1
+        else:
+            logger.info(f"Decoy account '{username}' deleted successfully.")
+            stats["ad_success"] += 1
 
-    # --- Delete the Decoy OU if empty ---
-    try:
-        delete_ou_if_empty(ldap_conn, dc_config["decoy_ou"], dry_run=dry_run)
-    except Exception as e:
-        logger.error(f"Failed to clean up Decoy OU: {e}")
-
-    # --- Delete the deployment record files ---
-    if not dry_run:
-        try:
-            os.remove(LIST_FILE)
-            logger.info(f"Deleted deployment record '{LIST_FILE}'")
-        except Exception as e:
-            logger.error(f"Failed to delete '{LIST_FILE}': {e}")
-
-        # Delete the Wazuh CDB list file
-        if os.path.exists(CDB_FILE):
-            try:
-                os.remove(CDB_FILE)
-                logger.info(f"Deleted Wazuh CDB list '{CDB_FILE}'")
-            except Exception as e:
-                logger.error(f"Failed to delete '{CDB_FILE}': {e}")
+    # --- 4. Remove Decoy OU if empty ---
+    logger.info(f"Checking if Decoy OU '{ds['decoy_ou']}' is empty...")
+    ou_check_children = f"Get-ADUser -Filter * -SearchBase '{ds['decoy_ou']}' -ErrorAction SilentlyContinue"
+    code, stdout, stderr = _run_ps_cmd(ou_check_children)
+    
+    if code == 0 and not stdout:
+        logger.info(f"Decoy OU is empty. Deleting '{ds['decoy_ou']}'...")
+        remove_ou_cmd = f"Remove-ADOrganizationalUnit -Identity '{ds['decoy_ou']}' -Confirm:$false -ErrorAction SilentlyContinue"
+        code, stdout, stderr = _run_ps_cmd(remove_ou_cmd)
+        if code != 0:
+            logger.warning(f"Failed to delete Decoy OU: {stderr}")
+        else:
+            logger.info("Decoy OU deleted successfully.")
     else:
-        logger.info(f"[DRY-RUN] Would delete deployment record '{LIST_FILE}'")
-        logger.info(f"[DRY-RUN] Would delete Wazuh CDB list '{CDB_FILE}'")
+        logger.warning("Decoy OU is not empty or failed to check. Skipping OU deletion.")
 
-    # --- Print summary ---
+    # --- 5. Clean up local files ---
+    # Delete script and config from public share
+    for filename in [CLIENT_SCRIPT_NAME, CONFIG_SHARE_NAME]:
+        filepath = os.path.join(local_share_path, filename)
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                logger.info(f"Deleted shared file: {filepath}")
+            except Exception as e:
+                logger.warning(f"Failed to delete shared file '{filepath}': {e}")
+
+    # Delete local record files
+    for filename in [LIST_FILE, CDB_FILE]:
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+                logger.info(f"Deleted local file: {filename}")
+            except Exception as e:
+                logger.warning(f"Failed to delete local file '{filename}': {e}")
+
     logger.info("=" * 60)
     logger.info("CLEANUP SUMMARY")
-    logger.info(f"  Credentials removed:         {stats['cred_success']}")
-    logger.info(f"  Credentials failed:          {stats['cred_fail']}")
-    logger.info(f"  AD accounts deleted:         {stats['ad_success']}")
-    logger.info(f"  AD accounts failed:          {stats['ad_fail']}")
+    logger.info(f"  AD accounts deleted:        {stats['ad_success']}")
+    logger.info(f"  AD accounts failed:         {stats['ad_fail']}")
     logger.info("=" * 60)
 
 
 def main():
-    """CLI entry point — parses arguments and dispatches to deploy or cleanup."""
     parser = argparse.ArgumentParser(
         prog="honey_token_gen",
-        description=(
-            "Honey Token Generator — Deploy and clean up deception "
-            "honey-token credentials in Active Directory environments."
-        ),
+        description="GPO-Based Honey Token Generator for AD Environment (Local DC Orchestration).",
     )
-
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # --- Deploy subcommand ---
-    deploy_parser = subparsers.add_parser(
-        "deploy",
-        help="Deploy decoy accounts to AD and inject cached credentials on endpoints",
-    )
-    deploy_parser.add_argument(
-        "--config",
-        default="config.json",
-        help="Path to the JSON configuration file (default: config.json)",
-    )
-    deploy_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Simulate deployment without making any changes to AD or endpoints",
-    )
+    # Deploy subcommand
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy decoys locally on DC and configure GPO")
+    deploy_parser.add_argument("--config", default="config.json", help="Path to config file")
 
-    # --- Cleanup subcommand ---
-    cleanup_parser = subparsers.add_parser(
-        "cleanup",
-        help="Remove all deployed decoy accounts and cached credentials",
-    )
-    cleanup_parser.add_argument(
-        "--config",
-        default="config.json",
-        help="Path to the JSON configuration file (default: config.json)",
-    )
-    cleanup_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Simulate cleanup without making any changes to AD or endpoints",
-    )
+    # Cleanup subcommand
+    cleanup_parser = subparsers.add_parser("cleanup", help="Clean up decoys and GPOs from AD")
+    cleanup_parser.add_argument("--config", default="config.json", help="Path to config file")
 
     args = parser.parse_args()
 
-    # Show help if no command is provided
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    # Initialize logging after argument parsing
     setup_logging()
 
-    # Dispatch to the appropriate command handler
     if args.command == "deploy":
         cmd_deploy(args)
     elif args.command == "cleanup":

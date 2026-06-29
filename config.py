@@ -2,7 +2,7 @@
 config.py — Configuration Loading and Validation
 
 Loads the JSON config file and validates all required fields
-before the application proceeds with deploy or cleanup operations.
+before the application proceeds with local GPO/AD deployment.
 """
 
 import os
@@ -55,17 +55,24 @@ def _validate_config(config: dict) -> None:
         ValueError: If any validation check fails.
     """
     # --- Root-level keys ---
-    required_root_keys = ["domain_controller", "decoys", "endpoints"]
+    required_root_keys = ["domain_settings", "share_settings", "decoys"]
     for key in required_root_keys:
         if key not in config:
             raise ValueError(f"Missing required top-level key: '{key}'")
 
-    # --- Domain Controller section ---
-    dc = config["domain_controller"]
-    required_dc_keys = ["ip", "domain_name", "ldaps_port", "admin_username", "admin_password", "decoy_ou"]
-    for key in required_dc_keys:
-        if key not in dc:
-            raise ValueError(f"Missing required domain_controller field: '{key}'")
+    # --- Domain Settings ---
+    ds = config["domain_settings"]
+    required_ds_keys = ["domain_name", "decoy_ou", "gpo_name", "target_ou_dn"]
+    for key in required_ds_keys:
+        if key not in ds:
+            raise ValueError(f"Missing required domain_settings field: '{key}'")
+
+    # --- Share Settings ---
+    ss = config["share_settings"]
+    required_ss_keys = ["local_path", "network_path"]
+    for key in required_ss_keys:
+        if key not in ss:
+            raise ValueError(f"Missing required share_settings field: '{key}'")
 
     # --- Decoys section ---
     if not isinstance(config["decoys"], list) or len(config["decoys"]) == 0:
@@ -95,13 +102,3 @@ def _validate_config(config: dict) -> None:
                         f"Decoy '{username}': Invalid SPN format '{spn}'. "
                         f"Expected format: 'service/host' or 'service/host:port'"
                     )
-
-    # --- Endpoints section ---
-    if not isinstance(config["endpoints"], list) or len(config["endpoints"]) == 0:
-        raise ValueError("'endpoints' must be a non-empty list of endpoint definitions")
-
-    for idx, endpoint in enumerate(config["endpoints"]):
-        for key in ["ip", "hostname", "winrm_username", "winrm_password", "winrm_transport"]:
-            if key not in endpoint:
-                raise ValueError(f"Endpoint at index {idx} is missing required field '{key}'")
-

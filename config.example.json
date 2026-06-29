@@ -1,11 +1,14 @@
 {
-  "domain_controller": {
-    "ip": "192.168.100.50",
+  "domain_settings": {
     "domain_name": "NTT.local",
-    "ldaps_port": 636,
-    "admin_username": "NTT\\administrator",
-    "admin_password": "DCAdminPassword123!",
-    "decoy_ou": "OU=Decoys,DC=NTT,DC=local"
+    "decoy_ou": "OU=Decoys,DC=NTT,DC=local",
+    "gpo_name": "HoneyToken_GPO",
+    "target_ou_dn": "DC=NTT,DC=local"
+  },
+
+  "share_settings": {
+    "local_path": "C:\\Shares\\Public",
+    "network_path": "\\\\DC01\\Public"
   },
 
   "decoys": [
@@ -36,23 +39,6 @@
       "password": "DecoyAdminPass321!",
       "spns": [],
       "description": "System Administrator"
-    }
-  ],
-
-  "endpoints": [
-    {
-      "ip": "192.168.100.10",
-      "hostname": "WS01",
-      "winrm_username": "administrator",
-      "winrm_password": "WS01AdminPassword123!",
-      "winrm_transport": "ntlm"
-    },
-    {
-      "ip": "192.168.100.20",
-      "hostname": "WS02",
-      "winrm_username": "administrator",
-      "winrm_password": "WS02AdminPassword123!",
-      "winrm_transport": "ntlm"
     }
   ]
 }
