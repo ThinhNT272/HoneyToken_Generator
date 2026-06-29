@@ -34,7 +34,7 @@ function Grant-BatchLogonRight {
         [System.Runtime.InteropServices.Marshal]::Copy($sidBytes, 0, $SidPtr, $SID.BinaryLength)
 
         $o = New-Object Ls+L_O
-        $o.l = [System.Runtime.InteropServices.Marshal]::SizeOf([Ls+L_O])
+        $o.l = [System.Runtime.InteropServices.Marshal]::SizeOf($o)
         $PolicyHandle = [IntPtr]::Zero
         $access = 0x000F0811
         $res = [Ls]::LsaOpenPolicy([IntPtr]::Zero, [ref]$o, $access, [ref]$PolicyHandle)
