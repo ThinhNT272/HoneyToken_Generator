@@ -225,7 +225,8 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             decoy_ou_dn=ds["decoy_ou"],
             gpo_name=ds["gpo_name"],
             target_ou_dn=ds["target_ou_dn"],
-            network_script_path=network_script_path
+            script_cmdline=full_script_path,
+            script_parameters=full_script_args
         )
     except Exception as e:
         logger.error(f"Failed to create/configure GPO: {e}")

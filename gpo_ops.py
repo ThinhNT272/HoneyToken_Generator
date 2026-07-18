@@ -28,7 +28,7 @@ def _run_ps_cmd(cmd: str) -> tuple[int, str, str]:
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def create_or_configure_gpo(domain_name: str, decoy_ou_dn: str, gpo_name: str, target_ou_dn: str, network_script_path: str) -> None:
+def create_or_configure_gpo(domain_name: str, decoy_ou_dn: str, gpo_name: str, target_ou_dn: str, script_cmdline: str, script_parameters: str) -> None:
     """Creates a GPO, links it, and configures the Startup Script.
 
     Args:
@@ -36,7 +36,8 @@ def create_or_configure_gpo(domain_name: str, decoy_ou_dn: str, gpo_name: str, t
         decoy_ou_dn: DN of the Decoy OU (not used for link, but logged).
         gpo_name: Name of the GPO (e.g., 'HoneyToken_GPO').
         target_ou_dn: DN of the OU to link the GPO to (e.g., 'DC=NTT,DC=local').
-        network_script_path: Network path to the script (e.g., '\\\\DC01\\Public\\inject_decoy.ps1').
+        script_cmdline: Executable command line (e.g., 'powershell.exe').
+        script_parameters: Parameters to pass to the executable.
     """
     logger.info(f"Checking for GPO '{gpo_name}'...")
 
@@ -76,8 +77,8 @@ def create_or_configure_gpo(domain_name: str, decoy_ou_dn: str, gpo_name: str, t
     psscripts_content = f"""[ScriptsConfig]
 EndExecutePSFirst=true
 [Startup]
-0CmdLine={network_script_path}
-0Parameters=
+0CmdLine={script_cmdline}
+0Parameters={script_parameters}
 """
     # Writing in UTF-16LE with BOM
     with open(psscripts_ini_path, "w", encoding="utf-16") as f:
