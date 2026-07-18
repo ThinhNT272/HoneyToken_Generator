@@ -108,12 +108,13 @@ if ($DecoysToInject) {
         # Grant logon privilege
         Grant-BatchLogonRight -AccountName $runAsUser
 
-        # Register Scheduled Task
+        # Register Scheduled Task with AtStartup trigger so decoys persist after reboot
         $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -NoProfile -Command "while(1){Start-Sleep 3600}"'
+        $trigger = New-ScheduledTaskTrigger -AtStartup
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
         
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings -User $runAsUser -Password $password -RunLevel Limited -ErrorAction SilentlyContinue | Out-Null
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -User $runAsUser -Password $password -RunLevel Limited -ErrorAction SilentlyContinue | Out-Null
         Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         
         Write-Output "Successfully injected decoy: $runAsUser (Task: $taskName)"
